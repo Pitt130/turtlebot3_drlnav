@@ -51,6 +51,7 @@ class Logger():
                 self.file_log.write(f"distance: {sum(self.test_distance)/success_count:.3f}, "
                                     f"swerving: {sum(self.test_swerving)/success_count:.3f}, "
                                     f"duration: {sum(self.test_duration)/success_count:.3f}\n")
+        self.file_log.flush()
         if self.test_entry > 0:
             print(f"Successes: {self.test_outcome[SUCCESS]} ({self.test_outcome[SUCCESS]/self.test_entry:.2%}), "
             f"collision (wall): {self.test_outcome[COLLISION_WALL]} ({self.test_outcome[COLLISION_WALL]/self.test_entry:.2%}), "
@@ -66,6 +67,7 @@ class Logger():
     def init_training_log(self, datetime, path, stage, model_config):
         file_log = open(os.path.join(path, "_train_stage" + stage + "_" + datetime + '.txt'), 'w+')
         file_log.write("episode, reward, success, duration, steps, total_steps, memory length, avg_critic_loss, avg_actor_loss\n")
+        file_log.flush()
         with open(os.path.join(path, '_model_configuration_' + datetime + '.txt'), 'w+') as file_model_config:
             file_model_config.write(model_config + '\n')
         return file_log
@@ -73,7 +75,13 @@ class Logger():
     def init_testing_log(self, datetime, path, stage, load_episode):
         file_log = open(os.path.join(path, "_test_stage" + stage + "_eps" + str(load_episode) + "_" + datetime + '.txt'), 'w+')
         file_log.write(f"episode, outcome, step, episode_duration, distance, s/cw/co/t\n")
+        file_log.flush()
         return file_log
+
+    def close(self):
+        if getattr(self, 'file_log', None) and not self.file_log.closed:
+            self.file_log.flush()
+            self.file_log.close()
 
     def init_comparison_file(self, datetime, path, stage, hyperparameters, algorithm, session, episode):
         prefix = "_training" if self.is_training else "_testing"

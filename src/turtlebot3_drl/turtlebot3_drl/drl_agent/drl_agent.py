@@ -185,6 +185,7 @@ class DrlAgent(Node):
             self.graph.update_data(step, self.total_steps, outcome, reward_sum, loss_critic, lost_actor)
             self.logger.file_log.write(f"{self.episode}, {reward_sum}, {outcome}, {eps_duration}, {step}, {self.total_steps}, \
                                             {self.replay_buffer.get_length()}, {loss_critic / step}, {lost_actor / step}\n")
+            self.logger.file_log.flush()
 
             if (self.episode % MODEL_STORE_INTERVAL == 0) or (self.episode == 1):
                 self.sm.save_session(self.episode, self.model.networks, self.graph.graphdata, self.replay_buffer.buffer)
