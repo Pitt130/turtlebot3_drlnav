@@ -15,6 +15,7 @@ from turtlebot3_drl.common.replaybuffer import ReplayBuffer
 from turtlebot3_drl.common.settings import UNKNOWN
 from turtlebot3_drl.drl_agent.ddpg import DDPG
 from turtlebot3_drl.drl_agent.drl_agent_gymnasium import DrlAgentGymnasium
+from turtlebot3_drl.drl_gazebo.drl_gazebo import DRLGazebo, WORLD_RESET_SERVICE
 from turtlebot3_drl.drl_environment import reward as rw
 from turtlebot3_drl.drl_environment.drl_environment import (
     DRLEnvironment,
@@ -187,6 +188,31 @@ class StateParityTests(unittest.TestCase):
         DRLGymnasiumEnvironment.step(env, np.array([0.75, 0.5], dtype=np.float32))
 
         self.assertEqual(captured[0], (0.25, -0.5))
+
+
+class WorldResetTests(unittest.TestCase):
+    def test_goal_manager_uses_reset_world_to_preserve_animation_time(self):
+        self.assertEqual(WORLD_RESET_SERVICE, "reset_world")
+
+    def test_reset_world_calls_the_configured_service(self):
+        class _Client:
+            def __init__(self):
+                self.wait_count = 0
+                self.requests = []
+
+            def wait_for_service(self, timeout_sec):
+                self.wait_count += 1
+                return True
+
+            def call_async(self, request):
+                self.requests.append(request)
+
+        client = _Client()
+        goal_manager = types.SimpleNamespace(reset_world_client=client)
+        DRLGazebo.reset_world(goal_manager)
+
+        self.assertEqual(client.wait_count, 1)
+        self.assertEqual(len(client.requests), 1)
 
 
 if __name__ == "__main__":
