@@ -23,8 +23,8 @@ import sys
 import time
 
 import numpy as np
-import torch
 
+from ..common import utilities as util
 from ..common.settings import (
     ENABLE_STACKING,
     GRAPH_DRAW_INTERVAL,
@@ -36,13 +36,6 @@ from ..common.replaybuffer import ReplayBuffer
 from ..common.storagemanager import StorageManager
 from .ddpg import DDPG
 from .td3 import TD3
-
-
-def _check_gpu():
-    print("gpu torch available: ", torch.cuda.is_available())
-    if torch.cuda.is_available():
-        print("device name: ", torch.cuda.get_device_name(0))
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _as_float32_observation(observation):
@@ -97,7 +90,7 @@ class DrlAgentGymnasium:
         if self.algorithm not in ("ddpg", "td3"):
             raise ValueError("Gymnasium agent supports continuous-control algorithms: ddpg, td3")
 
-        self.device = _check_gpu()
+        self.device = util.check_gpu()
         if self.algorithm == "ddpg":
             self.model = DDPG(self.device, sim_speed)
         else:
