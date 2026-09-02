@@ -19,7 +19,6 @@
 import argparse
 import copy
 import os
-import pickle
 import sys
 import time
 
@@ -83,18 +82,13 @@ class DrlAgentGymnasium:
         self.training = bool(int(training)) if isinstance(training, str) else bool(training)
         self.load_session = load_session
         self.episode = int(load_episode)
+        self.env = env if env is not None else self._make_env()
+        self.observe_steps = int(observe_steps)
+        self.total_steps = 0
+        self.stage = stage
 
         if self.algorithm not in ("ddpg", "td3"):
             raise ValueError("Gymnasium agent supports continuous-control algorithms: ddpg, td3")
-        if not self.training and not self.load_session:
-            raise ValueError("Testing requires load_session to specify which model to evaluate")
-
-        self.env = env if env is not None else self._make_env()
-        # Random replay-buffer warm-up is a training-only phase and must not
-        # delay result logging during evaluation.
-        self.observe_steps = int(observe_steps) if self.training else 0
-        self.total_steps = 0
-        self.stage = stage
 
         self.device = util.check_gpu()
         if self.algorithm == "ddpg":
@@ -110,7 +104,6 @@ class DrlAgentGymnasium:
         self.logger = None
         self.graph = None
         self.last_saved_episode = None
-        self.loaded_graphdata = None
 
         if self.storage_enabled:
             self._init_storage()
@@ -120,7 +113,6 @@ class DrlAgentGymnasium:
             self.graph = Graph()
             if self.sm:
                 self.graph.session_dir = self.sm.session_dir
-            self._restore_graph_history()
         if self.logger_enabled:
             self._init_logger()
 
@@ -152,19 +144,6 @@ class DrlAgentGymnasium:
                 )
                 self.replay_buffer.buffer = self.sm.load_replay_buffer(self.model.buffer_size, buffer_path)
             self.last_saved_episode = self.episode
-            self.loaded_graphdata = self._load_graph_history()
-            if self.loaded_graphdata is not None:
-                self.total_steps = self.loaded_graphdata[0]
-                print(f"resumed session at global step: {self.total_steps}")
-            elif self.training:
-                # A loaded model has already completed its original warm-up.
-                # Missing optional graph history must not make it act randomly
-                # for OBSERVE_STEPS again.
-                self.total_steps = self.observe_steps
-                print(
-                    "resumed session has no usable global step count; "
-                    f"assuming observation warm-up is complete at {self.total_steps} steps"
-                )
         else:
             self.sm.new_session_dir(self.stage)
             self.sm.store_model(self.model)
@@ -186,48 +165,6 @@ class DrlAgentGymnasium:
             self.algorithm,
             self.episode,
         )
-
-    def _load_graph_history(self):
-        try:
-            graphdata = self.sm.load_graphdata()
-        except (OSError, EOFError, pickle.PickleError, TypeError, ValueError) as error:
-            print(f"could not load graph data of resumed session: {error}")
-            return None
-
-        if not isinstance(graphdata, (list, tuple)) or len(graphdata) != 5:
-            print("resumed session contains no usable graph data")
-            return None
-
-        try:
-            total_steps = int(graphdata[0])
-            if total_steps < 0:
-                raise ValueError("global step count cannot be negative")
-
-            columns = []
-            for column in graphdata[1:]:
-                if isinstance(column, (str, bytes)):
-                    raise TypeError("graph history columns must be sequences")
-                columns.append(list(column))
-        except (TypeError, ValueError) as error:
-            print(f"resumed session contains no usable graph data: {error}")
-            return None
-
-        return [total_steps] + columns
-
-    def _restore_graph_history(self):
-        if not self.load_session or self.episode <= 0 or self.graph is None:
-            return
-
-        graphdata = self.loaded_graphdata or [self.total_steps, [], [], [], []]
-        columns = []
-        placeholders = (UNKNOWN, 0.0, 0.0, 0.0)
-        for source, placeholder in zip(graphdata[1:], placeholders):
-            column = list(source[:self.episode])
-            if len(column) < self.episode:
-                column.extend([placeholder] * (self.episode - len(column)))
-            columns.append(column)
-
-        self.graph.set_graphdata([self.total_steps] + columns, self.episode)
 
     def _prepare_reset_state(self, observation):
         state = _as_float32_observation(observation)
@@ -286,12 +223,8 @@ class DrlAgentGymnasium:
                 )
 
             result = self.run_episode(max_steps_per_episode=episode_step_limit)
-            episode_before = self.episode
+            episodes_run += 1
             self.finish_episode(**result)
-            # Warm-up rollouts are not formal episodes and should not consume
-            # the caller's max_episodes budget.
-            if self.episode != episode_before:
-                episodes_run += 1
 
             if max_total_steps is not None and self.total_steps >= max_total_steps:
                 break
@@ -416,9 +349,7 @@ class DrlAgentGymnasium:
             self.graph.draw_plots(self.episode)
 
     def _save_checkpoint(self):
-        # Preserve the global step count even when plots are disabled so a
-        # resumed model does not repeat random replay-buffer warm-up.
-        graphdata = self.graph.graphdata if self.graph else [self.total_steps, [], [], [], []]
+        graphdata = self.graph.graphdata if self.graph else []
         self.sm.save_session(self.episode, self.model.networks, graphdata, self.replay_buffer.buffer)
         self.last_saved_episode = self.episode
         if self.logger and self.graph:
