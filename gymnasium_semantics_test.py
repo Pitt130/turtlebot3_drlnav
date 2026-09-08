@@ -15,7 +15,7 @@ from turtlebot3_drl.common.replaybuffer import ReplayBuffer
 from turtlebot3_drl.common.settings import UNKNOWN
 from turtlebot3_drl.drl_agent.ddpg import DDPG
 from turtlebot3_drl.drl_agent.drl_agent_gymnasium import DrlAgentGymnasium
-from turtlebot3_drl.drl_gazebo.drl_gazebo import DRLGazebo, WORLD_RESET_SERVICE
+from turtlebot3_drl.drl_gazebo.drl_gazebo import DRLGazebo
 from turtlebot3_drl.drl_environment import reward as rw
 from turtlebot3_drl.drl_environment.drl_environment import (
     DRLEnvironment,
@@ -152,12 +152,12 @@ class StateParityTests(unittest.TestCase):
         legacy_state = np.asarray(
             DRLEnvironment.get_state(legacy, *previous_action), dtype=np.float32
         )
-        gym_state = DRLGymnasiumEnvironment.get_state(gym_env, *previous_action)
+        gym_state = DRLGymnasiumEnvironment.get_state(gym_env, *previous_action, check_terminal=False)
 
         self.assertEqual(gym_state.shape, (NUM_SCAN_SAMPLES + 4,))
         self.assertTrue(np.allclose(gym_state, legacy_state))
 
-    def test_step_embeds_legacy_previous_action(self):
+    def test_next_state_embeds_just_executed_action(self):
         captured = []
 
         class _Publisher:
@@ -165,6 +165,9 @@ class StateParityTests(unittest.TestCase):
                 pass
 
         env = types.SimpleNamespace(
+            _needs_reset=False,
+            time_sec=0.,
+            step_sim_time=.1,
             action_space=spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32),
             previous_action=np.array([0.25, -0.5], dtype=np.float32),
             cmd_vel_pub=_Publisher(),
@@ -177,6 +180,8 @@ class StateParityTests(unittest.TestCase):
             obstacle_distance=3.5,
         )
         env._spin_once = lambda: None
+        env._set_physics = lambda paused: None
+        env._wait_for_observation = lambda target: setattr(env,"time_sec",target)
         env._get_info = lambda: {"success": UNKNOWN}
 
         def capture_state(linear, angular):
@@ -187,14 +192,11 @@ class StateParityTests(unittest.TestCase):
         rw.reward_initalize(1.0)
         DRLGymnasiumEnvironment.step(env, np.array([0.75, 0.5], dtype=np.float32))
 
-        self.assertEqual(captured[0], (0.25, -0.5))
+        self.assertEqual(captured[0], (0.75, 0.5))
 
 
 class WorldResetTests(unittest.TestCase):
-    def test_goal_manager_uses_reset_world_to_preserve_animation_time(self):
-        self.assertEqual(WORLD_RESET_SERVICE, "reset_world")
-
-    def test_reset_world_calls_the_configured_service(self):
+    def test_reset_simulation_calls_the_configured_service(self):
         class _Client:
             def __init__(self):
                 self.wait_count = 0
@@ -208,8 +210,8 @@ class WorldResetTests(unittest.TestCase):
                 self.requests.append(request)
 
         client = _Client()
-        goal_manager = types.SimpleNamespace(reset_world_client=client)
-        DRLGazebo.reset_world(goal_manager)
+        goal_manager = types.SimpleNamespace(reset_simulation_client=client)
+        DRLGazebo.reset_simulation(goal_manager)
 
         self.assertEqual(client.wait_count, 1)
         self.assertEqual(len(client.requests), 1)

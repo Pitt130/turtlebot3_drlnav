@@ -66,7 +66,7 @@ SERVICE_WAIT_TIMEOUT_SEC = 3.0
 class DRLGymnasiumEnvironment(Node, gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, spin_timeout_sec=0.1, reset_timeout_sec=10.0):
+    def __init__(self, spin_timeout_sec=0.1, reset_timeout_sec=10.0, step_sim_time=0.1):
         Node.__init__(self, "drl_gymnasium_environment")
         gym.Env.__init__(self)
         self.spec = EnvSpec(
@@ -82,6 +82,17 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             self.stage = int(f.read())
         print(f"running on stage: {self.stage}")
 
+        if not math.isfinite(step_sim_time) or step_sim_time <= 0:
+            raise ValueError("step_sim_time must be positive and finite")
+        self.step_sim_time = float(step_sim_time)
+        self.odom_stamp = -math.inf
+        self.scan_stamp = -math.inf
+        self.last_step_sim_dt = 0.0
+        self._clock_received = False
+        self._clock_epoch = 0
+        self._awaiting_rewind = False
+        self._pending_outcome = None
+        self._needs_reset = True
         self.spin_timeout_sec = spin_timeout_sec
         self.reset_timeout_sec = reset_timeout_sec
         self.episode_timeout = EPISODE_TIMEOUT_SECONDS
@@ -129,6 +140,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         )
 
         qos = QoSProfile(depth=10)
+        sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         qos_clock = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -136,10 +148,10 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         )
         self.cmd_vel_pub = self.create_publisher(Twist, self.velo_topic, qos)
         self.goal_pose_sub = self.create_subscription(Pose, self.goal_topic, self.goal_pose_callback, qos)
-        self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, qos)
-        self.scan_sub = self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, qos_profile=qos_profile_sensor_data)
+        self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, sensor_qos)
+        self.scan_sub = self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, qos_profile=sensor_qos)
         self.clock_sub = self.create_subscription(Clock, "/clock", self.clock_callback, qos_profile=qos_clock)
-        self.obstacle_odom_sub = self.create_subscription(Odometry, "obstacle/odom", self.obstacle_odom_callback, qos)
+        self.obstacle_odom_sub = self.create_subscription(Odometry, "obstacle/odom", self.obstacle_odom_callback, sensor_qos)
         self.task_succeed_client = self.create_client(RingGoal, "task_succeed")
         self.task_fail_client = self.create_client(RingGoal, "task_fail")
         self.pause_physics_client = self.create_client(Empty, '/pause_physics')
@@ -158,6 +170,8 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         print(f"new goal! x: {self.goal_x} y: {self.goal_y}")
 
     def obstacle_odom_callback(self, msg):
+        if self._awaiting_rewind:
+            return
         match = re.search(r"obstacle(\d+)", msg.child_frame_id)
         if match is None:
             self.get_logger().error(f"received odom was not from an obstacle: {msg.child_frame_id}")
@@ -174,6 +188,8 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self.obstacle_distances[obstacle_id] = math.sqrt(diff_y**2 + diff_x**2)
 
     def odom_callback(self, msg):
+        if self._awaiting_rewind:
+            return
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
         roll, pitch, yaw = util.euler_from_quaternion(msg.pose.pose.orientation)
@@ -205,8 +221,11 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
 
         self.goal_distance = distance_to_goal
         self.goal_angle = goal_angle
+        self.odom_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
     def scan_callback(self, msg):
+        if self._awaiting_rewind:
+            return
         if len(msg.ranges) != NUM_SCAN_SAMPLES:
             print(f"more or less scans than expected! check model.sdf, got: {len(msg.ranges)}, expected: {NUM_SCAN_SAMPLES}")
 
@@ -225,9 +244,17 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             if scan_range < min_scan_range:
                 min_scan_range = scan_range
         self.obstacle_distance = min_scan_range
+        self.scan_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
     def clock_callback(self, msg):
-        self.time_sec = msg.clock.sec
+        stamp = msg.clock.sec + msg.clock.nanosec * 1e-9
+        if self._clock_received and stamp < self.time_sec - 1e-9:
+            self._clock_epoch += 1
+            self.odom_stamp = self.scan_stamp = -math.inf
+            self.obstacle_distances = [math.inf] * MAX_NUMBER_OBSTACLES
+            self._awaiting_rewind = False
+        self.time_sec = stamp
+        self._clock_received = True
         if not self.reset_deadline:
             return
 
@@ -243,6 +270,13 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self.clock_msgs_skipped = 0
 
     def stop_reset_robot(self, success):
+        # Preserve the terminal observation; request world changes only in reset().
+        self.cmd_vel_pub.publish(Twist())
+        self.done = True
+        self._needs_reset = True
+        self._pending_outcome = bool(success)
+
+    def _request_outcome_reset(self, success):
         self.reset_request_failed = False
         self.cmd_vel_pub.publish(Twist())
         self.episode_deadline = math.inf
@@ -284,7 +318,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self.new_goal = False
         self._goal_reset_future = self.task_fail_client.call_async(req)
 
-    def get_state(self, action_linear_previous, action_angular_previous):
+    def get_state(self, action_linear_previous, action_angular_previous, check_terminal=True):
         state = copy.deepcopy(self.scan_ranges)
         state.append(float(numpy.clip((self.goal_distance / MAX_GOAL_DISTANCE), 0, 1)))
         state.append(float(self.goal_angle) / math.pi)
@@ -292,7 +326,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         state.append(float(action_angular_previous))
         self.local_step += 1
 
-        if self.local_step <= 30:
+        if not check_terminal:
             state = numpy.asarray(state, dtype=numpy.float32)
             state = numpy.nan_to_num(state, nan=0.0, posinf=1.0, neginf=0.0)
             return numpy.clip(state, self.observation_space.low, self.observation_space.high).astype(numpy.float32)
@@ -319,60 +353,113 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         state = numpy.nan_to_num(state, nan=0.0, posinf=1.0, neginf=0.0)
         return numpy.clip(state, self.observation_space.low, self.observation_space.high).astype(numpy.float32)
 
-    def _unpause_physics(self):
-        if not self.unpause_physics_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('/unpause_physics service not available')
-            return False
+    def _set_physics(self, paused):
+        client = self.pause_physics_client if paused else self.unpause_physics_client
+        if not client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f"Gazebo {client.srv_name} service unavailable")
+        future = client.call_async(Empty.Request())
+        self._spin_until(future.done, 5.0)
+        if not future.done() or future.result() is None:
+            raise RuntimeError(f"Gazebo {client.srv_name} service timed out or failed")
 
-        future = self.unpause_physics_client.call_async(Empty.Request())
-        start_time = time.monotonic()
+    def _observation_ready(self, target):
+        # A pre-reset header can be numerically larger than all new timestamps.
+        # Bound inter-topic scheduling skew to one configured simulation step.
+        return (not self._awaiting_rewind
+                and self.time_sec >= target - 1e-9
+                and target - 1e-9 <= self.odom_stamp <= self.time_sec + self.step_sim_time + 1e-9
+                and target - 1e-9 <= self.scan_stamp <= self.time_sec + self.step_sim_time + 1e-9)
 
-        while rclpy.ok() and not future.done():
-            self._spin_once()
-            if time.monotonic() - start_time >= 2.0:
-                self.get_logger().warn('/unpause_physics call timed out')
-                return False
+    def _timing_details(self, target):
+        return (f"target={target:.9f}, clock={self.time_sec:.9f}, "
+                f"odom={self.odom_stamp:.9f}, scan={self.scan_stamp:.9f}, "
+                f"epoch={self._clock_epoch}, awaiting_rewind={self._awaiting_rewind}")
 
-        return future.result() is not None
+    def _wait_for_observation(self, target):
+        epoch = self._clock_epoch
+        self._spin_until(
+            lambda: self._clock_epoch != epoch or self._observation_ready(target),
+            self.reset_timeout_sec,
+        )
+        if self._clock_epoch != epoch:
+            raise RuntimeError("Simulation clock reset during observation wait; "
+                               + self._timing_details(target))
+        if not self._observation_ready(target):
+            raise RuntimeError("Timed out waiting for fresh /clock, /odom and /scan; "
+                               + self._timing_details(target))
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         if seed is not None:
             self.action_space.seed(seed)
+        self._needs_reset = True
         self.cmd_vel_pub.publish(Twist())
+        try:
+            self._set_physics(False)
+            # Original task_fail acknowledges before reset_simulation completes.
+            # Observe a nonzero clock first so its rewind can be detected even
+            # on the first reset immediately after starting Gazebo.
+            self._spin_until(lambda: self._clock_received and self.time_sec >= 0.2,
+                             self.reset_timeout_sec)
+            if not self._clock_received or self.time_sec < 0.2:
+                raise RuntimeError("No pre-reset simulation clock; "
+                                   + self._timing_details(0.2))
+            epoch_before = self._clock_epoch
+            expect_rewind = self._pending_outcome is not True
+            self._awaiting_rewind = expect_rewind
+            self._goal_reset_future = None
+            if self._pending_outcome is not None:
+                self._request_outcome_reset(self._pending_outcome)
+            else:
+                self._request_reset_goal()
+            self._spin_until(
+                lambda: self.new_goal and self._goal_reset_future is not None
+                and self._goal_reset_future.done(), self.reset_timeout_sec,
+            )
+            if (not self.new_goal or self._goal_reset_future is None
+                    or not self._goal_reset_future.done()
+                    or self._goal_reset_future.result() is None):
+                raise RuntimeError("Goal reset failed; refusing a stale initial observation")
+            if expect_rewind:
+                self._spin_until(lambda: self._clock_epoch > epoch_before,
+                                 self.reset_timeout_sec)
+                if self._clock_epoch <= epoch_before:
+                    raise RuntimeError("Goal service returned but reset_simulation "
+                                       "clock rewind was not observed; "
+                                       + self._timing_details(self.time_sec))
+            self._goal_reset_future = None
+            self.odom_stamp = self.scan_stamp = -math.inf
+            self._wait_for_observation(self.time_sec + self.step_sim_time)
+            self._pending_outcome = None
+        finally:
+            self._set_physics(True)
+
         self.previous_action = numpy.zeros(2, dtype=numpy.float32)
         self.succeed = UNKNOWN
-        self.total_distance = 0.0
-        self.local_step = 0
         self.done = False
-        self.reset_deadline = True
+        self.reset_deadline = False
         self.clock_msgs_skipped = 0
-        self._unpause_physics()
-        if self._goal_reset_future is None:
-            self._request_reset_goal()
-        self._spin_until(lambda: self.new_goal, self.reset_timeout_sec)
-        self._goal_reset_future = None
-        reset_timeout = not self.new_goal
-        if reset_timeout:
-            self.get_logger().warning(f"reset timed out after {self.reset_timeout_sec:.1f}s")
-
-        if not reset_timeout:
-            self._spin_until(lambda: not self.reset_deadline, 2.0)
-
-        if not reset_timeout and self.reset_deadline:
-            self.get_logger().warning("reset deadline was not updated before continuing")
-
+        self.total_distance = 0.0
+        self.robot_x_prev, self.robot_y_prev = self.robot_x, self.robot_y
+        self.local_step = 0
+        episode_time = self.episode_timeout
+        if ENABLE_DYNAMIC_GOALS:
+            episode_time = float(numpy.clip(episode_time * self.difficulty_radius, 10, 50))
+        self.episode_deadline = self.time_sec + episode_time
         self.initial_distance_to_goal = self.goal_distance
         rw.reward_initalize(self.initial_distance_to_goal)
-        observation = self.get_state(0.0, 0.0)
+        observation = self.get_state(0.0, 0.0, check_terminal=False)
+        self._needs_reset = False
         info = self._get_info()
-        info["reset_timeout"] = reset_timeout
-
-        self._unpause_physics()
+        info["reset_timeout"] = False
         return observation, info
 
     def step(self, action):
+        if self._needs_reset:
+            raise RuntimeError("Call reset() before step() or after an episode ends")
         action = numpy.asarray(action, dtype=numpy.float32)
+        if action.shape != (2,) or not numpy.isfinite(action).all():
+            raise ValueError("action must contain two finite values")
         action = numpy.clip(action, self.action_space.low, self.action_space.high)
 
         noisy_action = action.copy()
@@ -392,15 +479,26 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         twist.angular.z = float(action_angular)
         self.cmd_vel_pub.publish(twist)
 
-        for _ in range(10):
-            self._spin_once()
+        start = self.time_sec
+        step_epoch = getattr(self, "_clock_epoch", 0)
+        try:
+            self._set_physics(False)
+            self._wait_for_observation(start + self.step_sim_time)
+        except Exception:
+            self._needs_reset = True
+            self.cmd_vel_pub.publish(Twist())
+            raise
+        finally:
+            self._set_physics(True)
+        if getattr(self, "_clock_epoch", 0) != step_epoch:
+            self._needs_reset = True
+            self.cmd_vel_pub.publish(Twist())
+            raise RuntimeError("Simulation clock reset before step completed; "
+                               + self._timing_details(start + self.step_sim_time))
+        self.last_step_sim_dt = self.time_sec - start
 
-        # Keep the legacy DRL state timing: the observation returned for the
-        # current transition contains the action from the preceding transition.
-        observation = self.get_state(
-            self.previous_action[LINEAR],
-            self.previous_action[ANGULAR],
-        )
+        # In s_(t+1), the previous action is the action just executed (a_t).
+        observation = self.get_state(noisy_action[LINEAR], noisy_action[ANGULAR])
         reward = rw.get_reward(
             self.succeed,
             action_linear,
@@ -430,7 +528,8 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         if self.closed:
             return
 
-        self.cmd_vel_pub.publish(Twist())
+        if rclpy.ok():
+            self.cmd_vel_pub.publish(Twist())
         self._executor.remove_node(self)
         self.destroy_node()
         self.closed = True
@@ -455,12 +554,17 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
     def _get_info(self):
         return {
             "success": self.succeed,
+            "is_success": self.succeed == SUCCESS,
             "goal_distance": self.goal_distance,
             "goal_angle": self.goal_angle,
             "obstacle_distance": self.obstacle_distance,
             "robot_pose": (self.robot_x, self.robot_y),
             "reset_request_failed": self.reset_request_failed,
             "time_sec": self.time_sec,
+            "step_sim_dt": self.last_step_sim_dt,
+            "odom_stamp": self.odom_stamp,
+            "scan_stamp": self.scan_stamp,
+            "clock_epoch": self._clock_epoch,
         }
 
 

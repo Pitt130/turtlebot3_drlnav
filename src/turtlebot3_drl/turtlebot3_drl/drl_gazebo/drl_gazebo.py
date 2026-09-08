@@ -36,9 +36,6 @@ from ..drl_environment.drl_environment import ARENA_LENGTH, ARENA_WIDTH, ENABLE_
 from ..common.settings import ENABLE_TRUE_RANDOM_GOALS
 
 NO_GOAL_SPAWN_MARGIN = 0.3 # meters away from any wall
-WORLD_RESET_SERVICE = 'reset_world'
-
-
 class DRLGazebo(Node):
     def __init__(self):
         super().__init__('drl_gazebo')
@@ -70,11 +67,7 @@ class DRLGazebo(Node):
         # Initialise client
         self.delete_entity_client       = self.create_client(DeleteEntity, 'delete_entity')
         self.spawn_entity_client        = self.create_client(SpawnEntity, 'spawn_entity')
-        # Stage 4 uses Gazebo PoseAnimation for its moving obstacles. The
-        # reset_simulation service rewinds simulation time and can leave those
-        # animations permanently frozen after an episode reset. reset_world
-        # restores model poses without rewinding the simulation clock.
-        self.reset_world_client         = self.create_client(Empty, WORLD_RESET_SERVICE)
+        self.reset_simulation_client    = self.create_client(Empty, 'reset_simulation')
         self.gazebo_pause               = self.create_client(Empty, '/pause_physics')
 
         # Initialise servers
@@ -90,7 +83,7 @@ class DRLGazebo(Node):
 
     def init_callback(self):
         self.delete_entity()
-        self.reset_world()
+        self.reset_simulation()
         self.publish_callback()
         print("Init, goal pose:", self.goal_x, self.goal_y)
         time.sleep(1)
@@ -118,7 +111,7 @@ class DRLGazebo(Node):
 
     def task_fail_callback(self, request, response):
         self.delete_entity()
-        self.reset_world()
+        self.reset_simulation()
         if ENABLE_TRUE_RANDOM_GOALS:
             self.generate_random_goal()
             print(f"fail: reset the environment, (random) goal pose: {self.goal_x:.2f}, {self.goal_y:.2f}")
@@ -150,7 +143,7 @@ class DRLGazebo(Node):
             if tries > 200:
                 print("ERROR: cannot find valid new goal, resestting!")
                 self.delete_entity()
-                self.reset_world()
+                self.reset_simulation()
                 self.generate_goal_pose()
                 break
         self.publish_callback()
@@ -171,7 +164,7 @@ class DRLGazebo(Node):
             if tries > 100:
                 print("Error! couldn't find valid goal position, resetting..")
                 self.delete_entity()
-                self.reset_world()
+                self.reset_simulation()
                 self.generate_goal_pose()
                 return
             tries += 1
@@ -215,13 +208,11 @@ class DRLGazebo(Node):
                 break
         self.publish_callback()
 
-    def reset_world(self):
+    def reset_simulation(self):
         req = Empty.Request()
-        while not self.reset_world_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info(
-                f'{WORLD_RESET_SERVICE} service not available, waiting again...'
-            )
-        self.reset_world_client.call_async(req)
+        while not self.reset_simulation_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('reset service not available, waiting again...')
+        self.reset_simulation_client.call_async(req)
 
     def delete_entity(self):
         req = DeleteEntity.Request()

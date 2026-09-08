@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=2_000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--step-sim-time", type=float, default=0.1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--stationary-linear-threshold", type=float, default=0.02)
     parser.add_argument("--spin-angular-threshold", type=float, default=0.5)
@@ -84,6 +85,7 @@ def main() -> None:
         normalize_reward=False,
         gamma=0.99,
         vecnormalize_path=args.vecnormalize,
+        step_sim_time=args.step_sim_time,
     )
     model = TD3.load(str(args.model), env=env, device=args.device)
     model.action_noise = None
@@ -94,8 +96,8 @@ def main() -> None:
         with result_path.open("w", newline="") as output:
             writer = csv.DictWriter(output, fieldnames=FIELDS)
             writer.writeheader()
+            observation = env.reset()
             for episode in range(1, args.episodes + 1):
-                observation = env.reset()
                 total_reward = 0.0
                 linear_speeds = []
                 angular_speeds = []
@@ -118,14 +120,15 @@ def main() -> None:
 
                     observation, reward, done, infos = env.step(action)
                     total_reward += float(reward[0])
+                    info = infos[0]
                     if bool(done[0]):
-                        info = infos[0]
                         outcome_code = int(info.get("success", 0))
                         outcome = OUTCOME_NAMES.get(outcome_code, f"unknown_{outcome_code}")
                         break
                 else:
                     outcome_code = -1
                     outcome = "max_steps"
+                    observation = env.reset()
 
                 outcomes[outcome] += 1
                 record = {
