@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -224,53 +225,55 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate", type=float, default=0.003)
     parser.add_argument("--buffer-size", type=int, default=1_000_000)
-    parser.add_argument("--learning-starts", type=int, default=3_000)
+    parser.add_argument("--learning-starts", type=int, default=128)
     parser.add_argument(
         "--random-action-until",
         type=int,
+        default=25_000,
         help=(
             "Use uniformly random actions until this absolute timestep. "
-            "Defaults to --learning-starts, matching standard SB3 behavior."
+            "Defaults to 25000, matching the validated observation budget."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
         "--critic-loss",
         choices=("mse", "smooth_l1"),
-        default="mse",
+        default="smooth_l1",
     )
     parser.add_argument(
         "--max-grad-norm",
         type=float,
+        default=2.0,
         help="Clip actor and critic gradient norms to this value.",
     )
     parser.add_argument(
         "--optimizer",
         choices=("adam", "adamw"),
-        default="adam",
+        default="adamw",
     )
     parser.add_argument(
         "--critic-architecture",
         choices=("sb3", "tomas"),
-        default="sb3",
+        default="tomas",
         help="Use the standard SB3 critic or Tomas state/action split critic.",
     )
     parser.add_argument(
         "--weight-init",
         choices=("sb3", "tomas"),
-        default="sb3",
+        default="tomas",
         help="Use framework defaults or Tomas Xavier-uniform weights and 0.01 bias.",
     )
     parser.add_argument("--tau", type=float, default=0.003)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--noise", choices=("normal", "ou"), default="normal")
+    parser.add_argument("--noise", choices=("normal", "ou"), default="ou")
     parser.add_argument("--noise-sigma", type=float, default=0.1)
     parser.add_argument("--noise-dt", type=float, default=1.0,
                         help="OU discretization: 1.0 matches Tomas; 0.01 is SB3 default")
     parser.add_argument(
         "--normalize-reward",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument("--resume-model", type=Path)
     parser.add_argument("--resume-vecnormalize", type=Path)
@@ -458,19 +461,29 @@ def main() -> None:
         except KeyboardInterrupt:
             print("Training interrupted; saving current model and replay buffer.")
 
-        final_model = model_dir / "final_model"
-        final_vecnormalize = model_dir / "vecnormalize.pkl"
-        final_replay_buffer = model_dir / "replay_buffer.pkl"
-        model.save(str(final_model))
-        env.save(str(final_vecnormalize))
-        model.save_replay_buffer(str(final_replay_buffer))
-        print(f"model saved: {final_model}.zip")
-        print(f"VecNormalize saved: {final_vecnormalize}")
-        print(f"replay buffer saved: {final_replay_buffer}")
     finally:
-        diagnostics.close()
-        env.close()
-        shutdown_ros()
+        original = sys.exc_info()[1]
+        prefix = "emergency_" if original is not None else ""
+        failures = []
+        # Attempt each artifact independently; saving or closing must not hide
+        # the training exception. Emergency artifacts are not final results.
+        operations = [
+            ("model", lambda: model.save(str(model_dir / (prefix + "final_model")))),
+            ("normalization", lambda: env.save(str(model_dir / (prefix + "vecnormalize.pkl")))),
+            ("replay", lambda: model.save_replay_buffer(str(model_dir / (prefix + "replay_buffer.pkl")))),
+            ("diagnostics close", diagnostics.close),
+            ("environment close", env.close),
+            ("ROS shutdown", shutdown_ros),
+        ]
+        for label, operation in operations:
+            try:
+                operation()
+            except Exception as error:
+                failures.append(error)
+                print(f"Failed {label}: {error}", file=sys.stderr, flush=True)
+        if original is None and failures:
+            raise failures[0]
+        print(f"Exit artifacts attempted in {model_dir} (prefix={prefix!r})", flush=True)
 
 
 if __name__ == "__main__":

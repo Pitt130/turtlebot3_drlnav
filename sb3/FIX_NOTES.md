@@ -30,3 +30,16 @@ python gymnasium_semantics_test.py
 ```
 
 Models, replay buffers and large logs are excluded from this commit.
+
+## Reliability follow-up, 2026-09-09
+
+The same final model completed evaluation seeds 0–4 (100 episodes each): success rates 86%, 80%, 88%, 79%, 81%. Total: 414 successes / 500 episodes (82.8%), 47 obstacle collisions, 23 wall collisions, 16 timeouts. Weighted spin-command counts were 169/16470, 443/17033, 222/15020, 271/17196 and 464/17008. These runs precede the follow-up changes. Evaluation seeds do not imply independent training runs or fully controlled Gazebo goal/obstacle randomness.
+
+- A reset retry continues waiting for the original request and epoch instead of resending a reset. Difficulty updates occur once after successful reset and pause. An ambiguous failed service does not silently start a new transaction; recovery may require recreating the environment. Automatic training retry is intentionally not enabled.
+- Pause failures preserve an existing exception. Redundant Gymnasium action-history storage and callback-based deadline state were removed; step control and observation semantics are unchanged.
+- The shared obstacle odometry queue holds at least 10 messages. Samples are cached by obstacle ID, older updates rejected, and distances recomputed against the current robot pose. Samples older than max(0.2 seconds, two configured steps) are excluded from dynamic-collision classification. Missing samples still leave laser-detected collisions classified as walls; this change may alter collision subtype counts and needs further evaluation.
+- The CLI defaults now match the validated learning settings, including 128 learning-starts, 25000 random-action steps, smooth_l1, AdamW, Tomas initialization/critic, OU dt=1 and no reward normalization. Total-timesteps retains the small 5000 CLI default; the supplied training script defaults to 200000.
+- Training exceptions attempt emergency model, normalization and replay saves independently, then attempt all cleanup operations without masking the original error. This handles Python exceptions during learning, not SIGKILL, power loss, or failures before model initialization. Emergency files have the emergency_ prefix and are not completed training results.
+- Original reset_simulation, epoch checking, 0.1-second control interval, OU episode reset behavior and tumble threshold are retained. Service discovery waits were not optimized without latency measurements; each step still pauses/unpauses.
+
+Validation: semantic and clock regression tests, targeted exception/default/cache checks, real Gazebo injected reset-timeout retry and 10 reset/step cycles, plus a 160-step SB3 training smoke run. Extra diagnostic tests remain local. These checks establish interface reliability, not improved policy success rate; the trained model is unchanged.

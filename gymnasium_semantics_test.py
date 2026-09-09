@@ -181,6 +181,7 @@ class StateParityTests(unittest.TestCase):
         )
         env._spin_once = lambda: None
         env._set_physics = lambda paused: None
+        env._pause_preserving_error = lambda: None
         env._wait_for_observation = lambda target: setattr(env,"time_sec",target)
         env._get_info = lambda: {"success": UNKNOWN}
 

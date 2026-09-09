@@ -92,6 +92,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self._clock_epoch = 0
         self._awaiting_rewind = False
         self._pending_outcome = None
+        self._reset_context = None
         self._needs_reset = True
         self.spin_timeout_sec = spin_timeout_sec
         self.reset_timeout_sec = reset_timeout_sec
@@ -112,10 +113,9 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self.done = False
         self.succeed = UNKNOWN
         self.episode_deadline = math.inf
-        self.reset_deadline = False
-        self.clock_msgs_skipped = 0
 
         self.obstacle_distances = [math.inf] * MAX_NUMBER_OBSTACLES
+        self._obstacle_samples = {}
 
         self.new_goal = False
         self.goal_angle = 0.0
@@ -128,7 +128,6 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self.difficulty_radius = 1
         self.local_step = 0
         self.time_sec = 0
-        self.previous_action = numpy.zeros(2, dtype=numpy.float32)
 
         obs_low = numpy.array([0.0] * NUM_SCAN_SAMPLES + [0.0, -1.0, -1.0, -1.0], dtype=numpy.float32)
         obs_high = numpy.array([1.0] * NUM_SCAN_SAMPLES + [1.0, 1.0, 1.0, 1.0], dtype=numpy.float32)
@@ -151,7 +150,9 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, sensor_qos)
         self.scan_sub = self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, qos_profile=sensor_qos)
         self.clock_sub = self.create_subscription(Clock, "/clock", self.clock_callback, qos_profile=qos_clock)
-        self.obstacle_odom_sub = self.create_subscription(Odometry, "obstacle/odom", self.obstacle_odom_callback, sensor_qos)
+        obstacle_qos = QoSProfile(depth=max(10, MAX_NUMBER_OBSTACLES * 2),
+                                  reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.obstacle_odom_sub = self.create_subscription(Odometry, "obstacle/odom", self.obstacle_odom_callback, obstacle_qos)
         self.task_succeed_client = self.create_client(RingGoal, "task_succeed")
         self.task_fail_client = self.create_client(RingGoal, "task_fail")
         self.pause_physics_client = self.create_client(Empty, '/pause_physics')
@@ -183,6 +184,13 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             return
 
         robot_pos = msg.pose.pose.position
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if not all(math.isfinite(v) for v in (stamp, robot_pos.x, robot_pos.y)):
+            return
+        previous = self._obstacle_samples.get(obstacle_id)
+        if previous is not None and stamp < previous[0]:
+            return
+        self._obstacle_samples[obstacle_id] = (stamp, robot_pos.x, robot_pos.y)
         diff_x = self.robot_x - robot_pos.x
         diff_y = self.robot_y - robot_pos.y
         self.obstacle_distances[obstacle_id] = math.sqrt(diff_y**2 + diff_x**2)
@@ -252,22 +260,10 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             self._clock_epoch += 1
             self.odom_stamp = self.scan_stamp = -math.inf
             self.obstacle_distances = [math.inf] * MAX_NUMBER_OBSTACLES
+            self._obstacle_samples = {}
             self._awaiting_rewind = False
         self.time_sec = stamp
         self._clock_received = True
-        if not self.reset_deadline:
-            return
-
-        self.clock_msgs_skipped += 1
-        if self.clock_msgs_skipped <= 10:
-            return
-
-        episode_time = self.episode_timeout
-        if ENABLE_DYNAMIC_GOALS:
-            episode_time = numpy.clip(episode_time * self.difficulty_radius, 10, 50)
-        self.episode_deadline = self.time_sec + episode_time
-        self.reset_deadline = False
-        self.clock_msgs_skipped = 0
 
     def stop_reset_robot(self, success):
         # Preserve the terminal observation; request world changes only in reset().
@@ -288,11 +284,9 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         req.radius = numpy.clip(self.difficulty_radius, 0.5, 4)
 
         if success:
-            self.difficulty_radius *= 1.01
             client = self.task_succeed_client
             service_name = "task_succeed"
         else:
-            self.difficulty_radius *= 0.99
             client = self.task_fail_client
             service_name = "task_fail"
 
@@ -319,6 +313,13 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self._goal_reset_future = self.task_fail_client.call_async(req)
 
     def get_state(self, action_linear_previous, action_angular_previous, check_terminal=True):
+        # Recompute from the current robot pose; stale samples cannot classify
+        # a collision as dynamic. LaserScan still determines collision itself.
+        for obstacle_id, (stamp, x, y) in getattr(self, "_obstacle_samples", {}).items():
+            fresh = -self.step_sim_time <= self.time_sec - stamp <= max(0.2, 2 * self.step_sim_time)
+            self.obstacle_distances[obstacle_id] = (
+                math.hypot(self.robot_x - x, self.robot_y - y) if fresh else math.inf
+            )
         state = copy.deepcopy(self.scan_ranges)
         state.append(float(numpy.clip((self.goal_distance / MAX_GOAL_DISTANCE), 0, 1)))
         state.append(float(self.goal_angle) / math.pi)
@@ -370,6 +371,16 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
                 and target - 1e-9 <= self.odom_stamp <= self.time_sec + self.step_sim_time + 1e-9
                 and target - 1e-9 <= self.scan_stamp <= self.time_sec + self.step_sim_time + 1e-9)
 
+    def _pause_preserving_error(self):
+        original = sys.exc_info()[1]
+        try:
+            self._set_physics(True)
+        except Exception as pause_error:
+            self._needs_reset = True
+            if original is None:
+                raise
+            self.get_logger().error(f"Also failed to pause Gazebo: {pause_error}; original error: {original}")
+
     def _timing_details(self, target):
         return (f"target={target:.9f}, clock={self.time_sec:.9f}, "
                 f"odom={self.odom_stamp:.9f}, scan={self.scan_stamp:.9f}, "
@@ -404,14 +415,24 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             if not self._clock_received or self.time_sec < 0.2:
                 raise RuntimeError("No pre-reset simulation clock; "
                                    + self._timing_details(0.2))
-            epoch_before = self._clock_epoch
-            expect_rewind = self._pending_outcome is not True
-            self._awaiting_rewind = expect_rewind
-            self._goal_reset_future = None
-            if self._pending_outcome is not None:
-                self._request_outcome_reset(self._pending_outcome)
-            else:
-                self._request_reset_goal()
+            if self._reset_context is None:
+                self.reset_request_failed = False
+                self._reset_context = (self._clock_epoch, self._pending_outcome)
+                self._awaiting_rewind = self._pending_outcome is not True
+                self._goal_reset_future = None
+                if self._pending_outcome is not None:
+                    self._request_outcome_reset(self._pending_outcome)
+                else:
+                    self._request_reset_goal()
+                if self._goal_reset_future is None:
+                    # No request was sent; a later reset may safely try again.
+                    self._reset_context = None
+                    self._awaiting_rewind = False
+                    raise RuntimeError("Goal reset service unavailable; no request sent")
+            epoch_before, outcome = self._reset_context
+            expect_rewind = outcome is not True
+            # A retry waits for the same request and clock epoch. It never
+            # resends a potentially completed world reset or changes difficulty.
             self._spin_until(
                 lambda: self.new_goal and self._goal_reset_future is not None
                 and self._goal_reset_future.done(), self.reset_timeout_sec,
@@ -427,18 +448,18 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
                     raise RuntimeError("Goal service returned but reset_simulation "
                                        "clock rewind was not observed; "
                                        + self._timing_details(self.time_sec))
-            self._goal_reset_future = None
             self.odom_stamp = self.scan_stamp = -math.inf
             self._wait_for_observation(self.time_sec + self.step_sim_time)
-            self._pending_outcome = None
         finally:
-            self._set_physics(True)
+            self._pause_preserving_error()
 
-        self.previous_action = numpy.zeros(2, dtype=numpy.float32)
+        if outcome is not None:
+            self.difficulty_radius *= 1.01 if outcome else 0.99
+        self._pending_outcome = None
+        self._reset_context = None
+        self._goal_reset_future = None
         self.succeed = UNKNOWN
         self.done = False
-        self.reset_deadline = False
-        self.clock_msgs_skipped = 0
         self.total_distance = 0.0
         self.robot_x_prev, self.robot_y_prev = self.robot_x, self.robot_y
         self.local_step = 0
@@ -451,7 +472,6 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         observation = self.get_state(0.0, 0.0, check_terminal=False)
         self._needs_reset = False
         info = self._get_info()
-        info["reset_timeout"] = False
         return observation, info
 
     def step(self, action):
@@ -489,7 +509,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             self.cmd_vel_pub.publish(Twist())
             raise
         finally:
-            self._set_physics(True)
+            self._pause_preserving_error()
         if getattr(self, "_clock_epoch", 0) != step_epoch:
             self._needs_reset = True
             self.cmd_vel_pub.publish(Twist())
@@ -516,7 +536,6 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         if self.done:
             self._finish_episode_bookkeeping()
 
-        self.previous_action = noisy_action.astype(numpy.float32)
 
         if self.local_step % 200 == 0:
             print(f"Rtot: {reward:<8.2f}GD: {self.goal_distance:<8.2f}GA: {math.degrees(self.goal_angle):.1f}\t", end="")
@@ -549,7 +568,6 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         self.total_distance = 0.0
         self.local_step = 0
         self.done = False
-        self.reset_deadline = True
 
     def _get_info(self):
         return {
