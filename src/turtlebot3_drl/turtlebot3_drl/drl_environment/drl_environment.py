@@ -20,7 +20,6 @@ import math
 import numpy
 import sys
 import copy
-from numpy.core.numeric import Infinity
 
 from geometry_msgs.msg import Pose, Twist
 from rosgraph_msgs.msg import Clock
@@ -71,11 +70,11 @@ class DRLEnvironment(Node):
 
         self.done = False
         self.succeed = UNKNOWN
-        self.episode_deadline = Infinity
+        self.episode_deadline = math.inf
         self.reset_deadline = False
         self.clock_msgs_skipped = 0
 
-        self.obstacle_distances = [Infinity] * MAX_NUMBER_OBSTACLES
+        self.obstacle_distances = [math.inf] * MAX_NUMBER_OBSTACLES
 
         self.new_goal = False
         self.goal_angle = 0.0
@@ -192,7 +191,7 @@ class DRLEnvironment(Node):
 
     def stop_reset_robot(self, success):
         self.cmd_vel_pub.publish(Twist()) # stop robot
-        self.episode_deadline = Infinity
+        self.episode_deadline = math.inf
         self.done = True
         req = RingGoal.Request()
         req.robot_pose_x = self.robot_x

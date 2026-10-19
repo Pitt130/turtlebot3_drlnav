@@ -9,11 +9,10 @@ import torch
 import numpy
 from ..common.settings import REWARD_FUNCTION, COLLISION_OBSTACLE, COLLISION_WALL, TUMBLE, SUCCESS, TIMEOUT, RESULTS_NUM
 
-import xml.etree.ElementTree as ET
+from .simulation_config import current_stage, scan_count, simulation_speed
 
 try:
-    with open('/tmp/drlnav_current_stage.txt', 'r') as f:
-        stage = int(f.read())
+    stage = current_stage()
 except FileNotFoundError:
     print("\033[1m" + "\033[93m" + "Make sure to launch the gazebo simulation node first!" + "\033[0m}")
 
@@ -135,14 +134,7 @@ def euler_from_quaternion(quat):
     return roll, pitch, yaw
 
 def get_scan_count():
-    tree = ET.parse(os.getenv('DRLNAV_BASE_PATH') + '/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_burger/model.sdf')
-
-    root = tree.getroot()
-    for link in root.find('model').findall('link'):
-        if link.get('name') == 'base_scan':
-            return int(link.find('sensor').find('ray').find('scan').find('horizontal').find('samples').text)
+    return scan_count()
 
 def get_simulation_speed(stage):
-    tree = ET.parse(os.getenv('DRLNAV_BASE_PATH') + '/src/turtlebot3_simulations/turtlebot3_gazebo/worlds/turtlebot3_drl_stage' + str(stage) + '/burger.model')
-    root = tree.getroot()
-    return int(root.find('world').find('physics').find('real_time_factor').text)
+    return simulation_speed(stage)

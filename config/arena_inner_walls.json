@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "arena_length": 4.2,
+  "arena_width": 4.2,
+  "obstacles": [
+    {
+      "name": "inner_wall_1/inner_wall_1_collision",
+      "center": [
+        -2.0,
+        -1.5
+      ],
+      "size": [
+        1.0,
+        0.15
+      ],
+      "yaw": 0.0
+    },
+    {
+      "name": "inner_wall_2/inner_wall_2_collision",
+      "center": [
+        -0.5,
+        -2.0
+      ],
+      "size": [
+        1.0,
+        0.15
+      ],
+      "yaw": -1.5708
+    },
+    {
+      "name": "inner_wall_3/inner_wall_3_collision",
+      "center": [
+        1.0,
+        -1.0
+      ],
+      "size": [
+        1.0,
+        0.15
+      ],
+      "yaw": 1.5708
+    },
+    {
+      "name": "inner_wall_4/inner_wall_4_collision",
+      "center": [
+        1.2,
+        1.9
+      ],
+      "size": [
+        1.0,
+        0.15
+      ],
+      "yaw": -1.5708
+    },
+    {
+      "name": "inner_wall_5/inner_wall_5_collision",
+      "center": [
+        1.9,
+        0.4
+      ],
+      "size": [
+        1.0,
+        0.15
+      ],
+      "yaw": 0.0
+    },
+    {
+      "name": "inner_wall_6/inner_wall_6_collision",
+      "center": [
+        -0.5,
+        1.5
+      ],
+      "size": [
+        1.0,
+        0.15
+      ],
+      "yaw": 0.0
+    },
+    {
+      "name": "inner_wall_7/inner_wall_7_collision",
+      "center": [
+        -1.2,
+        0.092
+      ],
+      "size": [
+        1.0,
+        0.15
+      ],
+      "yaw": -1.5708
+    }
+  ]
+}

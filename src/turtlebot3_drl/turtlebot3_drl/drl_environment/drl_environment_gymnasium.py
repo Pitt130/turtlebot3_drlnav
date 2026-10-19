@@ -28,6 +28,8 @@ from rclpy.qos import (
 
 from . import reward as rw
 from ..common import utilities as util
+from ..common.lidar_adapter import clean_ranges, policy_scan
+from ..common.simulation_config import current_stage, simulation_backend
 from ..common.settings import (
     ARENA_LENGTH,
     ARENA_WIDTH,
@@ -54,8 +56,7 @@ from ..common.settings import (
 )
 
 
-# Automatically retrieved from Gazebo model configuration (40 by default).
-# Can be set manually if needed.
+# Explicit configuration or Gazebo model metadata; Isaac requires no SDF.
 NUM_SCAN_SAMPLES = util.get_scan_count()
 LINEAR = 0
 ANGULAR = 1
@@ -78,8 +79,10 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             nondeterministic=True,
         )
 
-        with open("/tmp/drlnav_current_stage.txt", "r") as f:
-            self.stage = int(f.read())
+        self.stage = current_stage()
+        # Gazebo's task_fail runs reset_simulation, which rewinds /clock; an
+        # Isaac task controller replies once its reset is done and keeps time.
+        self.reset_rewinds_clock = simulation_backend() == "gazebo"
         print(f"running on stage: {self.stage}")
 
         if not math.isfinite(step_sim_time) or step_sim_time <= 0:
@@ -234,24 +237,16 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
     def scan_callback(self, msg):
         if self._awaiting_rewind:
             return
-        if len(msg.ranges) != NUM_SCAN_SAMPLES:
-            print(f"more or less scans than expected! check model.sdf, got: {len(msg.ranges)}, expected: {NUM_SCAN_SAMPLES}")
-
-        min_scan_range = LIDAR_DISTANCE_CAP
-        for i in range(NUM_SCAN_SAMPLES):
-            if i < len(msg.ranges):
-                scan_range = float(msg.ranges[i])
-            else:
-                scan_range = LIDAR_DISTANCE_CAP
-
-            if not math.isfinite(scan_range):
-                scan_range = LIDAR_DISTANCE_CAP
-
-            scan_range = float(numpy.clip(scan_range, 0, LIDAR_DISTANCE_CAP))
-            self.scan_ranges[i] = float(numpy.clip(scan_range / LIDAR_DISTANCE_CAP, 0, 1))
-            if scan_range < min_scan_range:
-                min_scan_range = scan_range
-        self.obstacle_distance = min_scan_range
+        # Reject incompatible scans rather than reading the first rays of a
+        # differently shaped scan as the policy's full circle.
+        distances = policy_scan(msg.ranges, msg.angle_min, msg.angle_increment,
+                                NUM_SCAN_SAMPLES, LIDAR_DISTANCE_CAP,
+                                msg.range_min, msg.range_max)
+        self.scan_ranges = (distances / LIDAR_DISTANCE_CAP).tolist()
+        # Collisions use every valid ray: a close obstacle can sit between the
+        # policy directions, which only sample the scan.
+        self.obstacle_distance = float(numpy.min(clean_ranges(
+            msg.ranges, LIDAR_DISTANCE_CAP, msg.range_min, msg.range_max)))
         self.scan_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
     def clock_callback(self, msg):
@@ -418,7 +413,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
             if self._reset_context is None:
                 self.reset_request_failed = False
                 self._reset_context = (self._clock_epoch, self._pending_outcome)
-                self._awaiting_rewind = self._pending_outcome is not True
+                self._awaiting_rewind = self._pending_outcome is not True and self.reset_rewinds_clock
                 self._goal_reset_future = None
                 if self._pending_outcome is not None:
                     self._request_outcome_reset(self._pending_outcome)
@@ -430,7 +425,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
                     self._awaiting_rewind = False
                     raise RuntimeError("Goal reset service unavailable; no request sent")
             epoch_before, outcome = self._reset_context
-            expect_rewind = outcome is not True
+            expect_rewind = outcome is not True and self.reset_rewinds_clock
             # A retry waits for the same request and clock epoch. It never
             # resends a potentially completed world reset or changes difficulty.
             self._spin_until(

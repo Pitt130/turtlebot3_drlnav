@@ -1,4 +1,4 @@
-from numpy.core.numeric import Infinity
+import math
 from ..common.settings import COLLISION_OBSTACLE, COLLISION_WALL, TUMBLE, SUCCESS, TIMEOUT, RESULTS_NUM
 import time
 import os
@@ -18,7 +18,7 @@ class Logger():
         self.stage = stage
         self.algorithm = algorithm
 
-        self.highest_reward = -Infinity
+        self.highest_reward = -math.inf
         self.best_episode_reward = 0
         self.highest_success = 0
         self.best_episode_success = 0

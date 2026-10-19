@@ -38,6 +38,15 @@ OBSTACLE_RADIUS             = 0.16  # meters
 MAX_NUMBER_OBSTACLES        = 6
 ENABLE_MOTOR_NOISE          = False # Add normally distributed noise to motor output to simulate hardware imperfections
 
+# A shared geometry file lets Gazebo and Isaac use the same arena bounds.
+# With no override, all original settings and Gazebo SDF behavior are retained.
+import os as _os
+if _os.environ.get('DRLNAV_ARENA_CONFIG'):
+    from .arena_config import load_arena_config as _load_arena_config
+    _arena_config = _load_arena_config(_os.environ['DRLNAV_ARENA_CONFIG'])
+    ARENA_LENGTH = _arena_config.length
+    ARENA_WIDTH = _arena_config.width
+
 # --- REAL ROBOT ENVIRONMENT SETTINGS ---
 REAL_TOPIC_SCAN  = 'scan'
 REAL_TOPIC_VELO  = 'cmd_vel'

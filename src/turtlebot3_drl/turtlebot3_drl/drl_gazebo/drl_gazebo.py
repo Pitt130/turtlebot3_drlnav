@@ -27,6 +27,8 @@ from std_srvs.srv import Empty
 from geometry_msgs.msg import Pose
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile
 from rclpy.node import Node
 
@@ -34,8 +36,13 @@ from turtlebot3_msgs.srv import RingGoal
 import xml.etree.ElementTree as ET
 from ..drl_environment.drl_environment import ARENA_LENGTH, ARENA_WIDTH, ENABLE_DYNAMIC_GOALS
 from ..common.settings import ENABLE_TRUE_RANDOM_GOALS
+from ..common.simulation_config import current_stage
+from ..common.arena_config import load_arena_config
 
 NO_GOAL_SPAWN_MARGIN = 0.3 # meters away from any wall
+GAZEBO_REQUEST_TIMEOUT = 10.0 # seconds to wait for each Gazebo request
+
+
 class DRLGazebo(Node):
     def __init__(self):
         super().__init__('drl_gazebo')
@@ -51,8 +58,9 @@ class DRLGazebo(Node):
         self.entity = open(self.entity_path, 'r').read()
         self.entity_name = 'goal'
 
-        with open('/tmp/drlnav_current_stage.txt', 'r') as f:
-            self.stage = int(f.read())
+        self.stage = current_stage()
+        arena_path = os.environ.get('DRLNAV_ARENA_CONFIG')
+        self.arena_config = load_arena_config(arena_path) if arena_path else None
         print(f"running on stage: {self.stage}, dynamic goals enabled: {ENABLE_DYNAMIC_GOALS}")
 
         self.prev_x, self.prev_y = -1, -1
@@ -65,39 +73,57 @@ class DRLGazebo(Node):
         self.goal_pose_pub = self.create_publisher(Pose, 'goal_pose', QoSProfile(depth=10))
 
         # Initialise client
-        self.delete_entity_client       = self.create_client(DeleteEntity, 'delete_entity')
-        self.spawn_entity_client        = self.create_client(SpawnEntity, 'spawn_entity')
-        self.reset_simulation_client    = self.create_client(Empty, 'reset_simulation')
+        # Task services reply only after their Gazebo requests finish, so the
+        # responses must be handled by another executor thread (see main).
+        self.task_group = MutuallyExclusiveCallbackGroup()
+        gazebo_group = ReentrantCallbackGroup()
+        self.delete_entity_client       = self.create_client(DeleteEntity, 'delete_entity', callback_group=gazebo_group)
+        self.spawn_entity_client        = self.create_client(SpawnEntity, 'spawn_entity', callback_group=gazebo_group)
+        self.reset_simulation_client    = self.create_client(Empty, 'reset_simulation', callback_group=gazebo_group)
         self.gazebo_pause               = self.create_client(Empty, '/pause_physics')
 
         # Initialise servers
-        self.task_succeed_server    = self.create_service(RingGoal, 'task_succeed', self.task_succeed_callback)
-        self.task_fail_server       = self.create_service(RingGoal, 'task_fail', self.task_fail_callback)
+        self.task_succeed_server    = self.create_service(RingGoal, 'task_succeed', self.task_succeed_callback, callback_group=self.task_group)
+        self.task_fail_server       = self.create_service(RingGoal, 'task_fail', self.task_fail_callback, callback_group=self.task_group)
 
         self.obstacle_coordinates   = self.get_obstacle_coordinates()
-        self.init_callback()
+        # Runs once the executor spins, so it can wait for Gazebo like the services.
+        self.init_timer = self.create_timer(0.1, self.init_callback, callback_group=self.task_group)
 
     """*******************************************************************************
     ** Callback functions and relevant functions
     *******************************************************************************"""
 
     def init_callback(self):
-        self.delete_entity()
-        self.reset_simulation()
+        self.init_timer.cancel()
+        self.wait_for(self.delete_entity(), 'delete_entity')
+        self.wait_for(self.reset_simulation(), 'reset_simulation')
         self.publish_callback()
         print("Init, goal pose:", self.goal_x, self.goal_y)
         time.sleep(1)
 
     def publish_callback(self):
-        # Publish goal pose
+        # Announce the goal only once it exists: the environment treats this
+        # message as the end of a reset.
+        self.wait_for(self.spawn_entity(), 'spawn_entity')
         goal_pose = Pose()
         goal_pose.position.x = self.goal_x
         goal_pose.position.y = self.goal_y
         self.goal_pose_pub.publish(goal_pose)
-        self.spawn_entity()
+
+    def wait_for(self, future, name):
+        # Another executor thread completes the future (see main).
+        deadline = time.monotonic() + GAZEBO_REQUEST_TIMEOUT
+        while not future.done():
+            if time.monotonic() > deadline:
+                future.cancel()
+                self.get_logger().error(f'{name} did not finish within {GAZEBO_REQUEST_TIMEOUT:.0f} s')
+                return False
+            time.sleep(0.005)
+        return True
 
     def task_succeed_callback(self, request, response):
-        self.delete_entity()
+        self.wait_for(self.delete_entity(), 'delete_entity')
         if ENABLE_TRUE_RANDOM_GOALS:
             self.generate_random_goal()
             print(f"success: generate (random) a new goal, goal pose: {self.goal_x:.2f}, {self.goal_y:.2f}")
@@ -110,8 +136,8 @@ class DRLGazebo(Node):
         return response
 
     def task_fail_callback(self, request, response):
-        self.delete_entity()
-        self.reset_simulation()
+        self.wait_for(self.delete_entity(), 'delete_entity')
+        self.wait_for(self.reset_simulation(), 'reset_simulation')
         if ENABLE_TRUE_RANDOM_GOALS:
             self.generate_random_goal()
             print(f"fail: reset the environment, (random) goal pose: {self.goal_x:.2f}, {self.goal_y:.2f}")
@@ -124,6 +150,8 @@ class DRLGazebo(Node):
         return response
 
     def goal_is_valid(self, goal_x, goal_y):
+        if self.arena_config is not None:
+            return self.arena_config.goal_is_valid(goal_x, goal_y, NO_GOAL_SPAWN_MARGIN)
         if goal_x > ARENA_LENGTH/2 or goal_x < -ARENA_LENGTH/2 or goal_y > ARENA_WIDTH/2 or goal_y < -ARENA_WIDTH/2:
             return False
         for obstacle in self.obstacle_coordinates:
@@ -142,8 +170,8 @@ class DRLGazebo(Node):
             tries += 1
             if tries > 200:
                 print("ERROR: cannot find valid new goal, resestting!")
-                self.delete_entity()
-                self.reset_simulation()
+                self.wait_for(self.delete_entity(), 'delete_entity')
+                self.wait_for(self.reset_simulation(), 'reset_simulation')
                 self.generate_goal_pose()
                 break
         self.publish_callback()
@@ -163,8 +191,8 @@ class DRLGazebo(Node):
                 break
             if tries > 100:
                 print("Error! couldn't find valid goal position, resetting..")
-                self.delete_entity()
-                self.reset_simulation()
+                self.wait_for(self.delete_entity(), 'delete_entity')
+                self.wait_for(self.reset_simulation(), 'reset_simulation')
                 self.generate_goal_pose()
                 return
             tries += 1
@@ -212,14 +240,14 @@ class DRLGazebo(Node):
         req = Empty.Request()
         while not self.reset_simulation_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('reset service not available, waiting again...')
-        self.reset_simulation_client.call_async(req)
+        return self.reset_simulation_client.call_async(req)
 
     def delete_entity(self):
         req = DeleteEntity.Request()
         req.name = self.entity_name
         while not self.delete_entity_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('service not available, waiting again...')
-        self.delete_entity_client.call_async(req)
+        return self.delete_entity_client.call_async(req)
 
     def spawn_entity(self):
         goal_pose = Pose()
@@ -231,9 +259,12 @@ class DRLGazebo(Node):
         req.initial_pose = goal_pose
         while not self.spawn_entity_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('service not available, waiting again...')
-        self.spawn_entity_client.call_async(req)
+        return self.spawn_entity_client.call_async(req)
 
     def get_obstacle_coordinates(self):
+        if self.arena_config is not None:
+            return [box.axis_aligned_corners(NO_GOAL_SPAWN_MARGIN)
+                    for box in self.arena_config.obstacles]
         tree = ET.parse(os.getenv('DRLNAV_BASE_PATH') + '/src/turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_drl_world/inner_walls/model.sdf')
         root = tree.getroot()
         obstacle_coordinates = []
@@ -261,9 +292,12 @@ class DRLGazebo(Node):
 def main():
     rclpy.init()
     drl_gazebo = DRLGazebo()
-    rclpy.spin(drl_gazebo)
+    # Task services wait for Gazebo replies, which need a second thread.
+    executor = MultiThreadedExecutor()
+    executor.add_node(drl_gazebo)
+    executor.spin()
 
-    drl_gazebo.destroy()
+    drl_gazebo.destroy_node()
     rclpy.shutdown()
 
 if __name__ == '__main__':
