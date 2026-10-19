@@ -205,16 +205,26 @@ class IntegrationTests(unittest.TestCase):
         agent = DrlAgentGymnasium(training=True, env=EndlessEnv(), observe_steps=0)
         self.assertEqual(agent.stage, 4)
 
-    def test_env_timeout_is_terminal_but_the_local_limit_bootstraps(self):
+    def test_only_terminal_transitions_stop_bootstrapping(self):
         class TimeoutEnv(EndlessEnv):
             def step(self, action):
                 obs, r, _, _, info = super().step(action)
                 return obs, r, False, self.steps >= 3, info
 
+        class TerminalEnv(EndlessEnv):
+            def step(self, action):
+                obs, r, _, _, info = super().step(action)
+                return obs, r, self.steps >= 3, False, info
+
         agent = self.make_agent()
         agent.env = TimeoutEnv()
         agent.run_episode()
-        self.assertEqual(list(agent.replay_buffer.buffer[-1][4]), [True])
+        self.assertEqual(list(agent.replay_buffer.buffer[-1][4]), [False])
+
+        agent_terminal = self.make_agent()
+        agent_terminal.env = TerminalEnv()
+        agent_terminal.run_episode()
+        self.assertEqual(list(agent_terminal.replay_buffer.buffer[-1][4]), [True])
 
         agent2 = self.make_agent()
         agent2.run_episode(max_steps_per_episode=3)

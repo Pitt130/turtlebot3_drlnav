@@ -498,11 +498,11 @@ class DrlAgentGymnasium:
                     action_current,
                     [reward],
                     next_state,
-                    # drl_agent.py stores the service's done flag, which counts
-                    # a timeout as terminal, so the value target matches the ROS
-                    # baseline. Only this agent's own step limit -- which upstream
-                    # has no equivalent of -- keeps bootstrapping.
-                    [env_done],
+                    # Gymnasium semantics: only a true MDP terminal stops
+                    # bootstrapping. Time limits (the env's timeout and this
+                    # agent's own step limit) are truncations, so the value
+                    # target still uses next_state.
+                    [terminated],
                 )
                 # drl_agent.py starts optimizing as soon as the buffer holds
                 # one batch, warm-up included. Deferring it would change the
