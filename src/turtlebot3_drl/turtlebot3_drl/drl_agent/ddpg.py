@@ -90,7 +90,9 @@ class DDPG(OffPolicyAgent):
         return action.detach().cpu().data.numpy().tolist()
 
     def get_action_random(self):
-        return [np.clip(np.random.uniform(-1.0, 1.0), -1.0, 1.0)] * self.action_size
+        # One draw per action dimension; repeating a single draw made the linear
+        # and angular commands identical during the random warm-up.
+        return np.random.uniform(-1.0, 1.0, size=self.action_size).tolist()
 
     def train(self, state, action, reward, state_next, done):
         # optimize critic
