@@ -24,6 +24,7 @@
   <exec_depend>turtlebot3_description</exec_depend>
   <export>
     <build_type>ament_cmake</build_type>
-    <gazebo_ros gazebo_model_path="${prefix}/models"/>
+    <gazebo_ros gazebo_model_path="${prefix}/models"
+                plugin_path="${prefix}/models/turtlebot3_drl_world/obstacle_plugin/lib"/>
   </export>
 </package>
