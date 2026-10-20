@@ -83,6 +83,8 @@ def main():
     parser.add_argument("--livestream", action="store_true", help="stream the app over WebRTC")
     parser.add_argument("--public-ip", default="", help="address the client uses to reach this host")
     parser.add_argument("--view-hz", type=float, default=20.0, help="livestream frames per wall second")
+    parser.add_argument("--view-size", type=int, nargs=2, default=(1920, 1080), metavar=("W", "H"),
+                        help="livestream window and viewport size; the client may resize it")
     args = parser.parse_args()
     sys.path.insert(0, str(args.repo / "src" / "turtlebot3_drl"))
 
@@ -94,8 +96,13 @@ def main():
 
     from isaacsim import SimulationApp
     if args.livestream:
-        app = SimulationApp({"headless": True, "hide_ui": False, "width": 1280, "height": 720,
-                             "window_width": 1600, "window_height": 900})
+        # Viewport at the window size, rasterized RTX with FXAA: the default DLSS
+        # renders below the viewport size and accumulates over frames, which at
+        # --view-hz frames per second looks soft once the client scales it up.
+        w, h = args.view_size
+        app = SimulationApp({"headless": True, "hide_ui": False, "width": w, "height": h,
+                             "window_width": w, "window_height": h,
+                             "renderer": "RaytracedLighting", "anti_aliasing": 2})
         from isaacsim.core.utils.extensions import enable_extension
         stream = "/exts/omni.kit.livestream.app/primaryStream"
         app.set_setting(f"{stream}/streamType", "webrtc")
@@ -103,6 +110,7 @@ def main():
         app.set_setting(f"{stream}/streamPort", 47998)
         app.set_setting(f"{stream}/publicIp", args.public_ip)
         app.set_setting(f"{stream}/enableEventTracing", False)   # else NvStreamer-*.etli grows in the cwd
+        app.set_setting(f"{stream}/allowDynamicResize", True)    # follow the client window size
         app.set_setting("/app/window/drawMouse", True)
         enable_extension("omni.kit.livestream.app")
         enable_extension("isaacsim.util.debug_draw")
