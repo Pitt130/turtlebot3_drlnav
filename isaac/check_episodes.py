@@ -1,14 +1,17 @@
 """Run the real Gymnasium agent for several episodes against the Isaac runtime.
 
-Start turtlebot3_isaac_sim.py --stage 4 first, then:
-    DRLNAV_SIM_BACKEND=isaac DRLNAV_STAGE=4 .venv/bin/python isaac/check_episodes.py [episodes] [timeout_s]
+Start turtlebot3_isaac_sim.py --stage N first, then:
+    DRLNAV_SIM_BACKEND=isaac DRLNAV_STAGE=N .venv/bin/python isaac/check_episodes.py [episodes] [timeout_s]
 
-Checks every reset (robot back at the start after a failure, obstacles back at
-their start, goal from the stage list and >= 2 m from the previous one), every
+Checks every reset (robot back at the stage start after a failure, obstacles
+back at their start, goal from the stage list and >= 2 m from the previous one), every
 step (0.1 s of sim time, replay done == terminated), and task_succeed (new goal,
 robot not moved).
 """
 import math
+import os
+from pathlib import Path
+import re
 import sys
 import time
 
@@ -16,13 +19,23 @@ import numpy as np
 import rclpy
 from turtlebot3_msgs.srv import RingGoal
 
-from turtlebot3_drl.common.goal_poses import GOALS_STAGE_4_5_7
+from turtlebot3_drl.common.goal_poses import GOALS_STAGE_4_5_7, GOALS_STAGE_8_9_12, GOALS_STAGE_11
 from turtlebot3_drl.drl_agent.drl_agent_gymnasium import DrlAgentGymnasium
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stage_scene import load_stage  # noqa: E402
 
 EPISODES = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 TIMEOUT_S = float(sys.argv[2]) if len(sys.argv) > 2 else 15.0
 NAMES = {0: "UNKNOWN", 1: "SUCCESS", 2: "COLL_WALL", 3: "COLL_OBST", 4: "TIMEOUT", 5: "TUMBLE"}
-OBSTACLE_STARTS = {0: (2.0, 2.0), 1: (-2.0, -2.0)}
+STAGE = int(os.environ.get("DRLNAV_STAGE", "4"))
+SCENE = load_stage(Path(__file__).resolve().parent.parent, STAGE)
+# The env indexes obstacles by the first "obstacleN" in the p3d child frame, minus one.
+OBSTACLE_STARTS = {int(re.search(r"obstacle(\d+)", o.frame_id).group(1)) - 1: tuple(o.pose(0.0)[0][:2])
+                   for o in SCENE.obstacles}
+ROBOT_START = SCENE.robot_start[:2]
+GOAL_LIST = {4: GOALS_STAGE_4_5_7, 5: GOALS_STAGE_4_5_7, 7: GOALS_STAGE_4_5_7, 8: GOALS_STAGE_8_9_12,
+             9: GOALS_STAGE_8_9_12, 12: GOALS_STAGE_8_9_12, 11: GOALS_STAGE_11}.get(STAGE)
 
 
 def main():
@@ -70,18 +83,20 @@ def main():
                   f"(terminated={final['terminated']}, truncated={final['truncated']}, done stored={final['done']})",
                   flush=True)
 
-        # Resets: the first and every reset after a failure start at the origin.
+        # Resets: the first and every reset after a failure start at the stage start.
         bad_pose = [i for i, r in enumerate(resets) if (i == 0 or outcomes[i - 1] != "SUCCESS")
-                    and math.hypot(*r["pose"]) > 0.05]
+                    and math.hypot(r["pose"][0] - ROBOT_START[0], r["pose"][1] - ROBOT_START[1]) > 0.05]
         report("robot back at the start after task_fail", not bad_pose, f"({len(resets)} resets; bad: {bad_pose})")
         bad_obst = [i for i, r in enumerate(resets) if (i == 0 or outcomes[i - 1] != "SUCCESS")
                     and any(math.hypot(r["obstacles"][k][0] - sx, r["obstacles"][k][1] - sy) > 0.15
                             for k, (sx, sy) in OBSTACLE_STARTS.items() if k in r["obstacles"])]
-        report("obstacles restart with the episode", not bad_obst, f"(bad: {bad_obst}; e.g. {resets[-1]['obstacles']})")
+        seen = sorted({k for r in resets for k in r["obstacles"]})
+        report("obstacles restart with the episode", not bad_obst and seen == sorted(OBSTACLE_STARTS),
+               f"({len(seen)}/{len(OBSTACLE_STARTS)} obstacles seen; bad: {bad_obst}; e.g. {resets[-1]['obstacles']})")
         goals = [r["goal"] for r in resets]
-        in_list = all(list(g) in GOALS_STAGE_4_5_7 for g in goals)
+        in_list = GOAL_LIST is None or all(list(g) in GOAL_LIST for g in goals)
         apart = all(abs(a[0] - b[0]) + abs(a[1] - b[1]) >= 2 for a, b in zip(goals, goals[1:]))
-        report("goals from the stage 4 list, >= 2 m apart", in_list and apart, f"{goals}")
+        report(f"goals from the stage {STAGE} list, >= 2 m apart", in_list and apart, f"{goals}")
         report("every step advances 0.1 s", all(abs(d - 0.1) < 1e-6 for d in dts),
                f"({len(dts)} steps, min {min(dts):.4f}, max {max(dts):.4f})")
         report("replay done == terminated", all(r["done"] == r["terminated"] for r in records),

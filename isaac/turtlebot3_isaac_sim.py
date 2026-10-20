@@ -6,8 +6,9 @@ paused, like the Gazebo launch with pause:=true. It also replaces drl_gazebo as
 the task controller: task_fail resets the robot and restarts the obstacle
 animations (Gazebo's reset_simulation, without rewinding /clock), task_succeed
 keeps the robot; both pick the next goal with the shared goal_poses module,
-publish goal_pose and reply only then. Run after sourcing Jazzy and the
-workspace (for turtlebot3_msgs):
+publish goal_pose and reply only then. --record DIR saves a top-down view with the
+lidar rays every 0.1 s of sim time (scene_recorder.py makes the MP4). Run after
+sourcing Jazzy and the workspace (for turtlebot3_msgs):
 
     source /opt/ros/jazzy/setup.bash
     OMNI_KIT_ACCEPT_EULA=YES ~/isaacsim/.venv/bin/python isaac/turtlebot3_isaac_sim.py \
@@ -17,6 +18,7 @@ import argparse
 import math
 import os
 from pathlib import Path
+import signal
 import sys
 import time
 
@@ -31,6 +33,7 @@ CLOCK_HZ = 10.0
 WHEEL_ACCEL = 1.0                # m/s^2 at the wheel rim, gazebo_ros_diff_drive max_wheel_acceleration
 BASE_LINK_HEIGHT = 0.010         # base_footprint -> base_link fixed joint
 BASE_SCAN = "/World/burger/Geometry/base_footprint/base_link/base_scan"
+SCAN_OFFSET = -0.032             # base_scan relative to base_footprint, along +x
 TEST_WALLS = {"wall_x": ((0.6, 0.0), (0.15, 1.0)), "wall_y": ((0.0, 0.7), (1.0, 0.15))}
 
 
@@ -71,6 +74,9 @@ def main():
     # With the 1 m/s^2 rim ramp these match Gazebo within 1% (check_ros_interface.py).
     parser.add_argument("--wheel-friction", type=float, default=1.0)
     parser.add_argument("--caster-friction", type=float, default=0.0)
+    parser.add_argument("--record", type=Path, help="write top-down JPEG frames with lidar rays to this directory")
+    parser.add_argument("--record-hz", type=float, default=10.0, help="frames per second of sim time")
+    parser.add_argument("--record-size", type=int, default=720)
     args = parser.parse_args()
     sys.path.insert(0, str(args.repo / "src" / "turtlebot3_drl"))
 
@@ -128,13 +134,22 @@ def main():
                                                  color=np.array([0.1, 0.8, 0.2])))
     world.reset()
     start_pos, start_quat = robot.get_world_pose()
+    recorder = None
+    if args.record:
+        from scene_recorder import TopDownRecorder
+        half_width = 1.5
+        if stage is not None:
+            half_width = max(abs(b.center[i]) + 0.5 * (abs(math.cos(b.yaw)) * b.size[i] + abs(math.sin(b.yaw)) * b.size[1 - i])
+                             for b in stage.boxes for i in (0, 1)) + 0.15
+        recorder = TopDownRecorder(world, args.record, half_width, size=args.record_size)
+        recorder.warm_up()
     wheels = [robot.get_dof_index(n) for n in WHEEL_JOINTS]
     drive = DiffDrive(WHEEL_RADIUS, WHEEL_SEPARATION)
 
     rclpy.init()
     node = Node("isaac_turtlebot3")
     state = {"playing": args.start_unpaused, "sim_time": 0.0, "steps": 0, "anim_offset": 0.0,
-             "goal": INITIAL_GOAL}
+             "goal": INITIAL_GOAL, "episode": 0, "last": "", "scan": None}   # the env resets via task_fail first
     clock_pub = node.create_publisher(Clock, "/clock", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
     odom_pub = node.create_publisher(Odometry, "odom", qos_profile_sensor_data)
     scan_pub = node.create_publisher(LaserScan, "scan", qos_profile_sensor_data)
@@ -170,10 +185,14 @@ def main():
         state["anim_offset"] = state["sim_time"]
         if move_obstacles is not None:
             move_obstacles(0.0)
+        state["episode"] += 1
+        state["last"] = "task_fail"
         publish_new_goal()
         return response
 
     def task_succeed(request, response):
+        state["episode"] += 1
+        state["last"] = "task_succeed"
         publish_new_goal()
         return response
 
@@ -212,6 +231,7 @@ def main():
 
     def publish_scan():
         ranges, _ = lidar.ranges()
+        state["scan"] = ranges
         msg = LaserScan()
         stamp(msg)
         msg.header.frame_id = "base_scan"
@@ -237,15 +257,31 @@ def main():
 
     sensor_every = max(1, int(round(args.physics_hz / args.sensor_hz)))
     clock_every = max(1, int(round(args.physics_hz / args.clock_hz)))
+    record_every = max(1, int(round(args.physics_hz / args.record_hz)))
+
+    def record_frame():
+        pos, quat = robot.get_world_pose()
+        w, x, y, z = (float(q) for q in quat)
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        origin = (float(pos[0]) + SCAN_OFFSET * math.cos(yaw), float(pos[1]) + SCAN_OFFSET * math.sin(yaw))
+        ranges = state["scan"] if state["scan"] is not None else []
+        angles = [lidar.angle_min + i * lidar.angle_increment for i in range(len(ranges))]
+        text = (f"stage {stage_number}   t {state['sim_time']:7.1f} s   episode {state['episode']}   "
+                f"goal ({state['goal'][0]:+.1f}, {state['goal'][1]:+.1f})   {state['last']}")
+        recorder.capture(text, origin, yaw, [float(r) for r in ranges], angles)
     dt = 1.0 / args.physics_hz
     scene = f"stage{stage.number} ({len(stage.boxes)} walls, {len(stage.obstacles)} obstacles)" if stage else args.scene
     print(f"isaac_turtlebot3 ready: scene={scene}, physics {args.physics_hz:.0f} Hz, "
           f"sensors {args.physics_hz / sensor_every:.0f} Hz, clock {args.physics_hz / clock_every:.0f} Hz, "
           f"rtf cap {args.rtf or 'none'}, {'running' if state['playing'] else 'paused'}", flush=True)
     publish_clock()
+    # Kit swallows SIGINT and only acts on it inside app.update(), which the paused
+    # loop never calls; stop on our own flag so recordings are flushed on exit.
+    signal.signal(signal.SIGINT, lambda *_: state.update(stop=True))
+    signal.signal(signal.SIGTERM, lambda *_: state.update(stop=True))
     wall_start, sim_start = time.monotonic(), 0.0
     try:
-        while app.is_running():
+        while app.is_running() and not state.get("stop"):
             rclpy.spin_once(node, timeout_sec=0.0)
             if not state["playing"]:
                 time.sleep(0.001)
@@ -266,6 +302,8 @@ def main():
                 publish_scan()
                 if stage is not None:
                     publish_obstacles()
+            if recorder is not None and state["steps"] % record_every == 0:
+                record_frame()
             if args.rtf > 0:
                 # Serve ROS while throttling, so a pause requested after this
                 # step's sensors stops time here instead of one step later; the
@@ -276,6 +314,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if recorder is not None:
+            recorder.close()
+            print(f"recorded {recorder.frames} frames to {args.record}", flush=True)
         node.destroy_node()
         rclpy.shutdown()
         app.close()
