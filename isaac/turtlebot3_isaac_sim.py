@@ -55,6 +55,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--usd", required=True)
     parser.add_argument("--scene", choices=["empty", "test_walls"], default="empty")
+    parser.add_argument("--stage", type=int, help="build turtlebot3_drl_stage<N> from the Gazebo files")
+    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--physics-hz", type=float, default=PHYSICS_HZ)
     parser.add_argument("--sensor-hz", type=float, default=SENSOR_HZ)
     parser.add_argument("--clock-hz", type=float, default=CLOCK_HZ)
@@ -86,6 +88,7 @@ def main():
     from build_turtlebot3 import (WHEEL_JOINTS, WHEEL_RADIUS, WHEEL_SEPARATION, apply_contact_materials,
                                   use_sphere_wheel_collisions)
     from turtlebot3_lidar import RANGE_MAX, RANGE_MIN, TurtleBot3Lidar
+    from stage_scene import build_in_isaac, load_stage
 
     world = World(physics_dt=1 / args.physics_hz, rendering_dt=1 / args.physics_hz)
     world.scene.add_default_ground_plane()
@@ -97,6 +100,10 @@ def main():
         for name, ((cx, cy), (sx, sy)) in TEST_WALLS.items():
             world.scene.add(FixedCuboid(prim_path=f"/World/{name}", name=name, position=np.array([cx, cy, 0.25]),
                                         scale=np.array([sx, sy, 0.5])))
+    stage, move_obstacles = None, None
+    if args.stage is not None:
+        stage = load_stage(args.repo, args.stage)
+        move_obstacles = build_in_isaac(world, stage)
     robot = world.scene.add(SingleArticulation(prim_path="/World/burger/Geometry/base_footprint/base_link",
                                                name="burger"))
     lidar = TurtleBot3Lidar(BASE_SCAN)
@@ -110,6 +117,8 @@ def main():
     clock_pub = node.create_publisher(Clock, "/clock", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
     odom_pub = node.create_publisher(Odometry, "odom", qos_profile_sensor_data)
     scan_pub = node.create_publisher(LaserScan, "scan", qos_profile_sensor_data)
+    # gazebo_ros_p3d on each obstacle: /obstacle/odom, world frame, scoped link name.
+    obstacle_pub = node.create_publisher(Odometry, "/obstacle/odom", 10)
     node.create_subscription(Twist, "cmd_vel", lambda m: drive.command(m.linear.x, m.angular.z), 10)
 
     def set_playing(playing):
@@ -162,10 +171,25 @@ def main():
         msg.ranges = [float(r) for r in ranges]
         scan_pub.publish(msg)
 
+    def publish_obstacles():
+        t, period = state["sim_time"], sensor_every * dt
+        for o in stage.obstacles:
+            (x, y, z), yaw = o.pose(t)
+            (px, py, _), pyaw = o.pose(max(0.0, t - period))
+            msg = Odometry()
+            stamp(msg)
+            msg.header.frame_id, msg.child_frame_id = "world", o.frame_id
+            msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z = x, y, z
+            msg.pose.pose.orientation.w, msg.pose.pose.orientation.z = math.cos(yaw / 2), math.sin(yaw / 2)
+            msg.twist.twist.linear.x, msg.twist.twist.linear.y = (x - px) / period, (y - py) / period
+            msg.twist.twist.angular.z = (yaw - pyaw) / period
+            obstacle_pub.publish(msg)
+
     sensor_every = max(1, int(round(args.physics_hz / args.sensor_hz)))
     clock_every = max(1, int(round(args.physics_hz / args.clock_hz)))
     dt = 1.0 / args.physics_hz
-    print(f"isaac_turtlebot3 ready: scene={args.scene}, physics {args.physics_hz:.0f} Hz, "
+    scene = f"stage{stage.number} ({len(stage.boxes)} walls, {len(stage.obstacles)} obstacles)" if stage else args.scene
+    print(f"isaac_turtlebot3 ready: scene={scene}, physics {args.physics_hz:.0f} Hz, "
           f"sensors {args.physics_hz / sensor_every:.0f} Hz, clock {args.physics_hz / clock_every:.0f} Hz, "
           f"rtf cap {args.rtf or 'none'}, {'running' if state['playing'] else 'paused'}", flush=True)
     publish_clock()
@@ -180,6 +204,8 @@ def main():
             targets = [0.0] * robot.num_dof
             targets[wheels[0]], targets[wheels[1]] = drive.step(dt)
             robot.apply_action(ArticulationAction(joint_velocities=targets))
+            if move_obstacles is not None:
+                move_obstacles((state["steps"] + 1) * dt)   # pose at the end of this step
             world.step(render=False)
             state["steps"] += 1
             state["sim_time"] = state["steps"] * dt
@@ -188,6 +214,8 @@ def main():
             if state["steps"] % sensor_every == 0:
                 publish_odom()
                 publish_scan()
+                if stage is not None:
+                    publish_obstacles()
             if args.rtf > 0:
                 # Serve ROS while throttling, so a pause requested after this
                 # step's sensors stops time here instead of one step later; the
