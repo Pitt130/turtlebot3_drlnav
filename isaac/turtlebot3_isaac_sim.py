@@ -85,6 +85,8 @@ def main():
     parser.add_argument("--view-hz", type=float, default=20.0, help="livestream frames per wall second")
     parser.add_argument("--view-size", type=int, nargs=2, default=(1920, 1080), metavar=("W", "H"),
                         help="livestream window and viewport size; the client may resize it")
+    parser.add_argument("--view-ui", action="store_true",
+                        help="stream the Isaac Sim UI around the viewport (default: viewport only)")
     args = parser.parse_args()
     sys.path.insert(0, str(args.repo / "src" / "turtlebot3_drl"))
 
@@ -100,7 +102,7 @@ def main():
         # renders below the viewport size and accumulates over frames, which at
         # --view-hz frames per second looks soft once the client scales it up.
         w, h = args.view_size
-        app = SimulationApp({"headless": True, "hide_ui": False, "width": w, "height": h,
+        app = SimulationApp({"headless": True, "hide_ui": not args.view_ui, "width": w, "height": h,
                              "window_width": w, "window_height": h,
                              "renderer": "RaytracedLighting", "anti_aliasing": 2})
         from isaacsim.core.utils.extensions import enable_extension
@@ -215,14 +217,20 @@ def main():
         goal_pub.publish(msg)
 
     def task_fail(request, response):
+        state["anim_offset"] = state["sim_time"]
+        if move_obstacles is not None:
+            # Obstacles first, in a physics step of their own: PhysX applies the
+            # kinematic move during the next step, so a robot placed in the same
+            # step can land inside an obstacle that has not left yet (after a
+            # collision near the start) and get launched at 100+ m/s. This step
+            # does not advance sim time or publish anything.
+            move_obstacles(0.0)
+            world.step(render=False)
         robot.set_world_pose(position=start_pos, orientation=start_quat)
         robot.set_linear_velocity(np.zeros(3))
         robot.set_angular_velocity(np.zeros(3))
         robot.set_joint_velocities(np.zeros(robot.num_dof))
         drive.stop()
-        state["anim_offset"] = state["sim_time"]
-        if move_obstacles is not None:
-            move_obstacles(0.0)
         state["episode"] += 1
         state["last"] = "task_fail"
         publish_new_goal()
