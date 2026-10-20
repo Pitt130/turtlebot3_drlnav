@@ -7,6 +7,9 @@ Run with Isaac Sim's Python, after sourcing ROS 2 Jazzy:
 
 The drive check commands wheel velocities from (v, w) exactly as a
 differential controller does and compares the base motion with the command.
+Gazebo reference (empty world, same protocol): straight 0.574 m / 0.0 deg,
+spin 167.7 deg, arc 0.329 m / 110.8 deg. Point-contact wheels reproduce it
+within about 1% in rotation; the URDF cylinders under-turn by 4-8%.
 """
 import argparse
 import math
@@ -29,6 +32,50 @@ def strip_xacro(source, target):
     Path(target).write_text(text)
 
 
+def apply_contact_materials(stage, root, wheel_friction, caster_friction):
+    """Match Gazebo's contacts: wheels barely slip (mu 1e5 there) and the caster
+    is a free ball joint there, while the URDF welds it to the base."""
+    from pxr import UsdPhysics, UsdShade
+    bound = []
+    for link, friction in (("wheel_left_link", wheel_friction), ("wheel_right_link", wheel_friction),
+                           ("caster_back_link", caster_friction)):
+        path = f"/World/PhysicsMaterials/{link}"
+        material = UsdShade.Material.Define(stage, path)
+        api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+        api.CreateStaticFrictionAttr(friction)
+        api.CreateDynamicFrictionAttr(friction)
+        api.CreateRestitutionAttr(0.0)
+        for prim in stage.Traverse():
+            p = prim.GetPath().pathString
+            if p.startswith(root) and f"/{link}/" in p and prim.HasAPI(UsdPhysics.CollisionAPI):
+                UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                    material, UsdShade.Tokens.weakerThanDescendants, "physics")
+                bound.append(f"{p} mu={friction}")
+    return bound
+
+
+def use_sphere_wheel_collisions(stage, root):
+    """Contact each wheel at one point on its mid-plane, like Gazebo's wheels.
+
+    The 18 mm wide collision cylinders touch the ground near their outer rims,
+    which widens the effective wheel separation and under-turns the robot.
+    """
+    from pxr import Gf, UsdGeom, UsdPhysics
+    replaced = []
+    for link in ("wheel_left_link", "wheel_right_link"):
+        for prim in list(stage.Traverse()):
+            p = prim.GetPath().pathString
+            if p.startswith(root) and p.endswith(f"/{link}/cylinder") and prim.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI(prim).CreateCollisionEnabledAttr(False)
+                sphere = UsdGeom.Sphere.Define(stage, prim.GetPath().GetParentPath().AppendChild("contact_sphere"))
+                sphere.CreateRadiusAttr(WHEEL_RADIUS)
+                sphere.CreatePurposeAttr(UsdGeom.Tokens.guide)
+                sphere.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0))
+                UsdPhysics.CollisionAPI.Apply(sphere.GetPrim())
+                replaced.append(sphere.GetPath().pathString)
+    return replaced
+
+
 def wheel_speeds(v, w):
     half = WHEEL_SEPARATION / 2
     return (v - w * half) / WHEEL_RADIUS, (v + w * half) / WHEEL_RADIUS
@@ -40,6 +87,11 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--damping", type=float, default=1.0e4)
     parser.add_argument("--physics-hz", type=float, default=200.0)
+    parser.add_argument("--wheel-friction", type=float, default=None)
+    parser.add_argument("--caster-friction", type=float, default=None)
+    parser.add_argument("--skip-import", action="store_true", help="reuse the USD in --out")
+    parser.add_argument("--cylinder-wheels", action="store_true",
+                        help="keep the URDF collision cylinders (under-turns ~5-9%% vs Gazebo)")
     args = parser.parse_args()
 
     from isaacsim import SimulationApp
@@ -52,15 +104,17 @@ def main():
 
     # Inside urdf/ so the importer resolves package://turtlebot3_description/meshes.
     urdf = args.description / "urdf" / "turtlebot3_burger_isaac.urdf"
-    strip_xacro(args.description / "urdf" / "turtlebot3_burger.urdf", urdf)
-    args.out.mkdir(parents=True, exist_ok=True)
-    config = URDFImporterConfig(
-        urdf_path=str(urdf), usd_path=str(args.out), fix_base=False,
-        joint_drive_type="force", joint_target_type="velocity",
-        override_joint_stiffness=0.0, override_joint_damping=args.damping,
-    )
-    usd_file = URDFImporter(config).import_urdf()
-    print(f"USD written: {usd_file}", flush=True)
+    usd_file = str(args.out / "turtlebot3_burger_isaac" / "turtlebot3_burger_isaac.usda")
+    if not args.skip_import:
+        strip_xacro(args.description / "urdf" / "turtlebot3_burger.urdf", urdf)
+        args.out.mkdir(parents=True, exist_ok=True)
+        config = URDFImporterConfig(
+            urdf_path=str(urdf), usd_path=str(args.out), fix_base=False,
+            joint_drive_type="force", joint_target_type="velocity",
+            override_joint_stiffness=0.0, override_joint_damping=args.damping,
+        )
+        usd_file = URDFImporter(config).import_urdf()
+        print(f"USD written: {usd_file}", flush=True)
 
     from isaacsim.core.api import World
     from isaacsim.core.prims import SingleArticulation
@@ -77,6 +131,12 @@ def main():
     stage = world.stage
     root = next(p.GetPath().pathString for p in stage.Traverse()
                 if p.GetPath().pathString.startswith("/World/burger") and p.HasAPI(UsdPhysics.ArticulationRootAPI))
+    if not args.cylinder_wheels:
+        for path in use_sphere_wheel_collisions(stage, "/World/burger"):
+            print("sphere wheel collision:", path, flush=True)
+    if args.wheel_friction is not None and args.caster_friction is not None:
+        for line in apply_contact_materials(stage, "/World/burger", args.wheel_friction, args.caster_friction):
+            print("material:", line, flush=True)
     robot = world.scene.add(SingleArticulation(prim_path=root, name="burger"))
     world.reset()
     print(f"articulation root: {root}; dof names: {robot.dof_names}", flush=True)
