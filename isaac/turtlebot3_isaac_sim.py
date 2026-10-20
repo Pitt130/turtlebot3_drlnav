@@ -7,7 +7,9 @@ the task controller: task_fail resets the robot and restarts the obstacle
 animations (Gazebo's reset_simulation, without rewinding /clock), task_succeed
 keeps the robot; both pick the next goal with the shared goal_poses module,
 publish goal_pose and reply only then. --record DIR saves a top-down view with the
-lidar rays every 0.1 s of sim time (scene_recorder.py makes the MP4). Run after
+lidar rays every 0.1 s of sim time (scene_recorder.py makes the MP4);
+--livestream serves the app over WebRTC (TCP 49100, UDP 47998) for the Isaac Sim
+WebRTC Streaming Client, rendering about --view-hz frames per wall second. Run after
 sourcing Jazzy and the workspace (for turtlebot3_msgs):
 
     source /opt/ros/jazzy/setup.bash
@@ -34,6 +36,7 @@ WHEEL_ACCEL = 1.0                # m/s^2 at the wheel rim, gazebo_ros_diff_drive
 BASE_LINK_HEIGHT = 0.010         # base_footprint -> base_link fixed joint
 BASE_SCAN = "/World/burger/Geometry/base_footprint/base_link/base_scan"
 SCAN_OFFSET = -0.032             # base_scan relative to base_footprint, along +x
+SCAN_HEIGHT = 0.172              # base_scan above base_link
 TEST_WALLS = {"wall_x": ((0.6, 0.0), (0.15, 1.0)), "wall_y": ((0.0, 0.7), (1.0, 0.15))}
 
 
@@ -77,6 +80,9 @@ def main():
     parser.add_argument("--record", type=Path, help="write top-down JPEG frames with lidar rays to this directory")
     parser.add_argument("--record-hz", type=float, default=10.0, help="frames per second of sim time")
     parser.add_argument("--record-size", type=int, default=720)
+    parser.add_argument("--livestream", action="store_true", help="stream the app over WebRTC")
+    parser.add_argument("--public-ip", default="", help="address the client uses to reach this host")
+    parser.add_argument("--view-hz", type=float, default=20.0, help="livestream frames per wall second")
     args = parser.parse_args()
     sys.path.insert(0, str(args.repo / "src" / "turtlebot3_drl"))
 
@@ -87,7 +93,21 @@ def main():
     stage_number = args.stage if args.stage is not None else int(os.environ.get("DRLNAV_STAGE", "1"))
 
     from isaacsim import SimulationApp
-    app = SimulationApp({"headless": True})
+    if args.livestream:
+        app = SimulationApp({"headless": True, "hide_ui": False, "width": 1280, "height": 720,
+                             "window_width": 1600, "window_height": 900})
+        from isaacsim.core.utils.extensions import enable_extension
+        stream = "/exts/omni.kit.livestream.app/primaryStream"
+        app.set_setting(f"{stream}/streamType", "webrtc")
+        app.set_setting(f"{stream}/signalPort", 49100)
+        app.set_setting(f"{stream}/streamPort", 47998)
+        app.set_setting(f"{stream}/publicIp", args.public_ip)
+        app.set_setting(f"{stream}/enableEventTracing", False)   # else NvStreamer-*.etli grows in the cwd
+        app.set_setting("/app/window/drawMouse", True)
+        enable_extension("omni.kit.livestream.app")
+        enable_extension("isaacsim.util.debug_draw")
+    else:
+        app = SimulationApp({"headless": True})
 
     import numpy as np
     import rclpy
@@ -145,6 +165,16 @@ def main():
         recorder.warm_up()
     wheels = [robot.get_dof_index(n) for n in WHEEL_JOINTS]
     drive = DiffDrive(WHEEL_RADIUS, WHEEL_SEPARATION)
+
+    draw = None
+    if args.livestream:
+        from isaacsim.core.utils.viewports import set_camera_view
+        from isaacsim.util.debug_draw import _debug_draw
+        draw = _debug_draw.acquire_debug_draw_interface()
+        set_camera_view(eye=np.array([0.0, -4.6, 6.2]), target=np.array([0.0, -0.3, 0.0]),
+                        camera_prim_path="/OmniverseKit_Persp")
+        for _ in range(30):
+            world.render()
 
     rclpy.init()
     node = Node("isaac_turtlebot3")
@@ -269,6 +299,25 @@ def main():
         text = (f"stage {stage_number}   t {state['sim_time']:7.1f} s   episode {state['episode']}   "
                 f"goal ({state['goal'][0]:+.1f}, {state['goal'][1]:+.1f})   {state['last']}")
         recorder.capture(text, origin, yaw, [float(r) for r in ranges], angles)
+
+    def live_frame():
+        """Lidar rays as debug lines (red: return, pink: none within range_max), then render."""
+        draw.clear_lines()
+        if state["scan"] is not None:
+            pos, quat = robot.get_world_pose()
+            w, x, y, z = (float(q) for q in quat)
+            yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+            ox, oy = float(pos[0]) + SCAN_OFFSET * math.cos(yaw), float(pos[1]) + SCAN_OFFSET * math.sin(yaw)
+            oz = float(pos[2]) + SCAN_HEIGHT
+            starts, ends, colors = [], [], []
+            for i, r in enumerate(state["scan"]):
+                a = yaw + lidar.angle_min + i * lidar.angle_increment
+                d = float(r) if math.isfinite(r) else RANGE_MAX
+                starts.append((ox, oy, oz))
+                ends.append((ox + d * math.cos(a), oy + d * math.sin(a), oz))
+                colors.append((1.0, 0.1, 0.1, 1.0) if math.isfinite(r) else (1.0, 0.7, 0.7, 0.4))
+            draw.draw_lines(starts, ends, colors, [2.0] * len(starts))
+        world.render()
     dt = 1.0 / args.physics_hz
     scene = f"stage{stage.number} ({len(stage.boxes)} walls, {len(stage.obstacles)} obstacles)" if stage else args.scene
     print(f"isaac_turtlebot3 ready: scene={scene}, physics {args.physics_hz:.0f} Hz, "
@@ -281,8 +330,12 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: state.update(stop=True))
     wall_start, sim_start = time.monotonic(), 0.0
     try:
+        next_view = 0.0
         while app.is_running() and not state.get("stop"):
             rclpy.spin_once(node, timeout_sec=0.0)
+            if draw is not None and time.monotonic() >= next_view:
+                next_view = time.monotonic() + 1.0 / args.view_hz
+                live_frame()
             if not state["playing"]:
                 time.sleep(0.001)
                 wall_start, sim_start = time.monotonic(), state["sim_time"]
