@@ -2,7 +2,12 @@
 
 Publishes /clock at 10 Hz and /odom, /scan at 50 Hz, the rates Gazebo uses, drives the
 wheels from /cmd_vel, and serves /pause_physics and /unpause_physics. It starts
-paused, like the Gazebo launch with pause:=true. Run after sourcing Jazzy:
+paused, like the Gazebo launch with pause:=true. It also replaces drl_gazebo as
+the task controller: task_fail resets the robot and restarts the obstacle
+animations (Gazebo's reset_simulation, without rewinding /clock), task_succeed
+keeps the robot; both pick the next goal with the shared goal_poses module,
+publish goal_pose and reply only then. Run after sourcing Jazzy and the
+workspace (for turtlebot3_msgs):
 
     source /opt/ros/jazzy/setup.bash
     OMNI_KIT_ACCEPT_EULA=YES ~/isaacsim/.venv/bin/python isaac/turtlebot3_isaac_sim.py \
@@ -10,6 +15,7 @@ paused, like the Gazebo launch with pause:=true. Run after sourcing Jazzy:
 """
 import argparse
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -66,22 +72,31 @@ def main():
     parser.add_argument("--wheel-friction", type=float, default=1.0)
     parser.add_argument("--caster-friction", type=float, default=0.0)
     args = parser.parse_args()
+    sys.path.insert(0, str(args.repo / "src" / "turtlebot3_drl"))
+
+    from turtlebot3_drl.common.settings import ENABLE_DYNAMIC_GOALS, ENABLE_TRUE_RANDOM_GOALS
+    if ENABLE_TRUE_RANDOM_GOALS or ENABLE_DYNAMIC_GOALS:
+        raise SystemExit("The Isaac task controller only implements the stage goal lists; "
+                         "ENABLE_TRUE_RANDOM_GOALS and ENABLE_DYNAMIC_GOALS are not supported yet")
+    stage_number = args.stage if args.stage is not None else int(os.environ.get("DRLNAV_STAGE", "1"))
 
     from isaacsim import SimulationApp
     app = SimulationApp({"headless": True})
 
     import numpy as np
     import rclpy
-    from geometry_msgs.msg import Twist
+    from geometry_msgs.msg import Pose, Twist
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from rosgraph_msgs.msg import Clock
     from sensor_msgs.msg import LaserScan
     from std_srvs.srv import Empty
+    from turtlebot3_msgs.srv import RingGoal
+    from turtlebot3_drl.common.goal_poses import INITIAL_GOAL, goal_rng, next_goal
 
     from isaacsim.core.api import World
-    from isaacsim.core.api.objects import FixedCuboid
+    from isaacsim.core.api.objects import FixedCuboid, VisualCylinder
     from isaacsim.core.prims import SingleArticulation
     from isaacsim.core.utils.stage import add_reference_to_stage
     from isaacsim.core.utils.types import ArticulationAction
@@ -107,13 +122,19 @@ def main():
     robot = world.scene.add(SingleArticulation(prim_path="/World/burger/Geometry/base_footprint/base_link",
                                                name="burger"))
     lidar = TurtleBot3Lidar(BASE_SCAN)
+    # drl_gazebo's goal_box: a 0.3 m radius visual without collision.
+    goal_marker = world.scene.add(VisualCylinder(prim_path="/World/goal", name="goal", radius=0.3, height=0.01,
+                                                 position=np.array([*INITIAL_GOAL, 0.005]),
+                                                 color=np.array([0.1, 0.8, 0.2])))
     world.reset()
+    start_pos, start_quat = robot.get_world_pose()
     wheels = [robot.get_dof_index(n) for n in WHEEL_JOINTS]
     drive = DiffDrive(WHEEL_RADIUS, WHEEL_SEPARATION)
 
     rclpy.init()
     node = Node("isaac_turtlebot3")
-    state = {"playing": args.start_unpaused, "sim_time": 0.0, "steps": 0}
+    state = {"playing": args.start_unpaused, "sim_time": 0.0, "steps": 0, "anim_offset": 0.0,
+             "goal": INITIAL_GOAL}
     clock_pub = node.create_publisher(Clock, "/clock", QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
     odom_pub = node.create_publisher(Odometry, "odom", qos_profile_sensor_data)
     scan_pub = node.create_publisher(LaserScan, "scan", qos_profile_sensor_data)
@@ -129,6 +150,35 @@ def main():
 
     node.create_service(Empty, "/pause_physics", set_playing(False))
     node.create_service(Empty, "/unpause_physics", set_playing(True))
+
+    goal_pub = node.create_publisher(Pose, "goal_pose", 10)
+    rng = goal_rng()
+
+    def publish_new_goal():
+        state["goal"] = next_goal(stage_number, state["goal"], rng)
+        goal_marker.set_world_pose(position=np.array([*state["goal"], 0.005]))
+        msg = Pose()
+        msg.position.x, msg.position.y = state["goal"]
+        goal_pub.publish(msg)
+
+    def task_fail(request, response):
+        robot.set_world_pose(position=start_pos, orientation=start_quat)
+        robot.set_linear_velocity(np.zeros(3))
+        robot.set_angular_velocity(np.zeros(3))
+        robot.set_joint_velocities(np.zeros(robot.num_dof))
+        drive.stop()
+        state["anim_offset"] = state["sim_time"]
+        if move_obstacles is not None:
+            move_obstacles(0.0)
+        publish_new_goal()
+        return response
+
+    def task_succeed(request, response):
+        publish_new_goal()
+        return response
+
+    node.create_service(RingGoal, "task_fail", task_fail)
+    node.create_service(RingGoal, "task_succeed", task_succeed)
 
     def stamp(msg):
         t = state["sim_time"]
@@ -172,7 +222,7 @@ def main():
         scan_pub.publish(msg)
 
     def publish_obstacles():
-        t, period = state["sim_time"], sensor_every * dt
+        t, period = state["sim_time"] - state["anim_offset"], sensor_every * dt
         for o in stage.obstacles:
             (x, y, z), yaw = o.pose(t)
             (px, py, _), pyaw = o.pose(max(0.0, t - period))
@@ -205,7 +255,7 @@ def main():
             targets[wheels[0]], targets[wheels[1]] = drive.step(dt)
             robot.apply_action(ArticulationAction(joint_velocities=targets))
             if move_obstacles is not None:
-                move_obstacles((state["steps"] + 1) * dt)   # pose at the end of this step
+                move_obstacles((state["steps"] + 1) * dt - state["anim_offset"])   # pose at the end of this step
             world.step(render=False)
             state["steps"] += 1
             state["sim_time"] = state["steps"] * dt

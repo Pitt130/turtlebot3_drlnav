@@ -38,6 +38,7 @@ from ..drl_environment.drl_environment import ARENA_LENGTH, ARENA_WIDTH, ENABLE_
 from ..common.settings import ENABLE_TRUE_RANDOM_GOALS
 from ..common.simulation_config import current_stage
 from ..common.arena_config import load_arena_config
+from ..common.goal_poses import goal_rng, next_goal
 
 NO_GOAL_SPAWN_MARGIN = 0.3 # meters away from any wall
 GAZEBO_REQUEST_TIMEOUT = 10.0 # seconds to wait for each Gazebo request
@@ -64,6 +65,7 @@ class DRLGazebo(Node):
         print(f"running on stage: {self.stage}, dynamic goals enabled: {ENABLE_DYNAMIC_GOALS}")
 
         self.prev_x, self.prev_y = -1, -1
+        self.goal_rng = goal_rng()
         self.goal_x, self.goal_y = 0.5, 0.0
 
         """************************************************************
@@ -202,38 +204,7 @@ class DRLGazebo(Node):
     def generate_goal_pose(self):
         self.prev_x = self.goal_x
         self.prev_y = self.goal_y
-        tries = 0
-
-        while ((abs(self.prev_x - self.goal_x) + abs(self.prev_y - self.goal_y)) < 2):
-            if self.stage == 11:
-                # --- Define static goal positions here ---
-                goal_pose_list = [[0.0, 0.0], [0.0, 6.5], [5.0, 5.5], [-2.5, -6.0], [3.0, -4.0], [6.0, -1.0]]
-                index = random.randrange(0, len(goal_pose_list))
-                self.goal_x = float(goal_pose_list[index][0])
-                self.goal_y = float(goal_pose_list[index][1])
-            elif self.stage == 8 or self.stage == 9 or self.stage == 12:
-                # --- Define static goal positions here ---
-                goal_pose_list = [[2.0, 2.0], [2.0, 1.5], [2.0, -0.5], [2.0, -1.0], [2.0, -2.0], [1.3, 1.0],
-                                    [1.0, 0.3], [1.0, -2.0], [0.3, -1.0],  [0.0, 2.0], [0.0, -1.0], [-1.0, 1.0],
-                                        [-1.0, -1.2], [-2.0, 1.0], [-2.2, 0.0], [-2.0, -2.2], [-2.4, 2.4]]
-                index = random.randrange(0, len(goal_pose_list))
-                self.goal_x = float(goal_pose_list[index][0])
-                self.goal_y = float(goal_pose_list[index][1])
-            elif self.stage not in [4, 5, 7]:
-                self.goal_x = random.randrange(-15, 16) / 10.0
-                self.goal_y = random.randrange(-15, 16) / 10.0
-            else:
-                # --- Define static goal positions here ---
-                goal_pose_list = [[1.0, 0.0], [2.0, -1.5], [0.0, -2.0], [2.0, 2.0], [0.8, 2.0],
-                                  [-1.9, 1.9], [-1.9,  0.2], [-1.9, -0.5], [-2.0, -2.0], [-0.5, -1.0],
-                                  [1.5, -1.0], [-0.5, 1.0], [-1.0, -2.0], [1.8, -0.2], [1.0, -1.9]]
-                index = random.randrange(0, len(goal_pose_list))
-                self.goal_x = float(goal_pose_list[index][0])
-                self.goal_y = float(goal_pose_list[index][1])
-            tries += 1
-            if tries > 100:
-                print("ERROR: distance between goals is small!")
-                break
+        self.goal_x, self.goal_y = next_goal(self.stage, (self.goal_x, self.goal_y), self.goal_rng)
         self.publish_callback()
 
     def reset_simulation(self):
