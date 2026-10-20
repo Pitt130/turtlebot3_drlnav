@@ -89,8 +89,8 @@ def main():
                         help="frames per wall second while no client is connected (keeps the stream up)")
     parser.add_argument("--view-size", type=int, nargs=2, default=(1920, 1080), metavar=("W", "H"),
                         help="livestream window and viewport size; the client may resize it")
-    parser.add_argument("--view-ui", action="store_true",
-                        help="stream the Isaac Sim UI around the viewport (default: viewport only)")
+    parser.add_argument("--viewport-only", action="store_true",
+                        help="stream only the viewport, without the Isaac Sim UI around it")
     args = parser.parse_args()
     sys.path.insert(0, str(args.repo / "src" / "turtlebot3_drl"))
 
@@ -106,7 +106,7 @@ def main():
         # renders below the viewport size and accumulates over frames, which at
         # --view-hz frames per second looks soft once the client scales it up.
         w, h = args.view_size
-        app = SimulationApp({"headless": True, "hide_ui": not args.view_ui, "width": w, "height": h,
+        app = SimulationApp({"headless": True, "hide_ui": args.viewport_only, "width": w, "height": h,
                              "window_width": w, "window_height": h,
                              "renderer": "RaytracedLighting", "anti_aliasing": 2})
         from isaacsim.core.utils.extensions import enable_extension
