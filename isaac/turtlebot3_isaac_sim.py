@@ -9,7 +9,9 @@ keeps the robot; both pick the next goal with the shared goal_poses module,
 publish goal_pose and reply only then. --record DIR saves a top-down view with the
 lidar rays every 0.1 s of sim time (scene_recorder.py makes the MP4);
 --livestream serves the app over WebRTC (TCP 49100, UDP 47998) for the Isaac Sim
-WebRTC Streaming Client, rendering about --view-hz frames per wall second. Run after
+WebRTC Streaming Client, rendering about --view-hz frames per wall second while a
+client is connected and --idle-view-hz otherwise (rendering costs up to half the
+speed when the sim runs uncapped). Run after
 sourcing Jazzy and the workspace (for turtlebot3_msgs):
 
     source /opt/ros/jazzy/setup.bash
@@ -83,6 +85,8 @@ def main():
     parser.add_argument("--livestream", action="store_true", help="stream the app over WebRTC")
     parser.add_argument("--public-ip", default="", help="address the client uses to reach this host")
     parser.add_argument("--view-hz", type=float, default=20.0, help="livestream frames per wall second")
+    parser.add_argument("--idle-view-hz", type=float, default=1.0,
+                        help="frames per wall second while no client is connected (keeps the stream up)")
     parser.add_argument("--view-size", type=int, nargs=2, default=(1920, 1080), metavar=("W", "H"),
                         help="livestream window and viewport size; the client may resize it")
     parser.add_argument("--view-ui", action="store_true",
@@ -127,7 +131,7 @@ def main():
     from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from rosgraph_msgs.msg import Clock
     from sensor_msgs.msg import LaserScan
-    from std_srvs.srv import Empty
+    from std_srvs.srv import Empty, SetBool
     from turtlebot3_msgs.srv import RingGoal
     from turtlebot3_drl.common.goal_poses import INITIAL_GOAL, goal_rng, next_goal
 
@@ -177,7 +181,23 @@ def main():
     drive = DiffDrive(WHEEL_RADIUS, WHEEL_SEPARATION)
 
     draw = None
+    viewers = {"clients": 0, "forced": False}
     if args.livestream:
+        import carb.eventdispatcher
+
+        def on_client(delta):
+            def callback(_event):
+                viewers["clients"] = max(0, viewers["clients"] + delta)
+                print(f"livestream client {'connected' if delta > 0 else 'disconnected'} "
+                      f"({viewers['clients']} connected)", flush=True)
+            return callback
+        dispatcher = carb.eventdispatcher.get_eventdispatcher()
+        client_subscriptions = [   # noqa: F841  (kept alive for the run)
+            dispatcher.observe_event(observer_name="isaac_turtlebot3", on_event=on_client(+1),
+                                     event_name="omni.kit.livestream.client_connected:immediate"),
+            dispatcher.observe_event(observer_name="isaac_turtlebot3", on_event=on_client(-1),
+                                     event_name="omni.kit.livestream.client_disconnected:immediate"),
+        ]
         from isaacsim.core.utils.viewports import set_camera_view
         from isaacsim.util.debug_draw import _debug_draw
         draw = _debug_draw.acquire_debug_draw_interface()
@@ -242,6 +262,12 @@ def main():
         publish_new_goal()
         return response
 
+    def force_live(request, response):
+        viewers["forced"] = bool(request.data)
+        response.success, response.message = True, f"live view {'forced on' if request.data else 'automatic'}"
+        return response
+
+    node.create_service(SetBool, "/isaac/livestream_live", force_live)
     node.create_service(RingGoal, "task_fail", task_fail)
     node.create_service(RingGoal, "task_succeed", task_succeed)
 
@@ -350,7 +376,8 @@ def main():
         while app.is_running() and not state.get("stop"):
             rclpy.spin_once(node, timeout_sec=0.0)
             if draw is not None and time.monotonic() >= next_view:
-                next_view = time.monotonic() + 1.0 / args.view_hz
+                live = viewers["clients"] > 0 or viewers["forced"]
+                next_view = time.monotonic() + 1.0 / (args.view_hz if live else args.idle_view_hz)
                 live_frame()
             if not state["playing"]:
                 time.sleep(0.001)
