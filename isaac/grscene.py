@@ -184,10 +184,15 @@ class GRScene:
         return max(self.hi[0] - self.lo[0], self.hi[1] - self.lo[1]) / 2 + 0.3
 
 
-def load_grscene(world, scene_dir, usd_name="start_result_navigation.usd", prim_path="/World/grscene"):
-    """Reference the scene (centimetres -> metres), disable its own physics scene, return its collider bounds."""
+def load_grscene(world, scene_dir, usd_name="start_result_navigation.usd", prim_path="/World/grscene",
+                 hide_ceilings=True, dome_intensity=1000.0):
+    """Reference the scene (centimetres -> metres), disable its own physics scene, return its collider bounds.
+
+    Ceilings are hidden (render only; their colliders are 2.8 m up and irrelevant to the robot) so
+    top-down views show the rooms, and a dome light is added because the scene's own lights are dim.
+    """
     from isaacsim.core.utils.stage import add_reference_to_stage
-    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
     scene_dir = Path(scene_dir)
     # GRScenes layers do not author metersPerUnit; USD's fallback for that is centimetres.
@@ -197,16 +202,45 @@ def load_grscene(world, scene_dir, usd_name="start_result_navigation.usd", prim_
     parent = UsdGeom.Xform.Define(world.stage, prim_path)
     parent.AddScaleOp().Set(Gf.Vec3d(scale, scale, scale))
     prim = add_reference_to_stage(usd_path=str(scene_dir / usd_name), prim_path=f"{prim_path}/scene")
+    rewritten, ceilings = 0, 0
     for p in Usd.PrimRange(prim):
         if p.IsA(UsdPhysics.Scene):             # the world already has one; two would split the colliders
             p.SetActive(False)
+        if hide_ceilings and "/ceiling/" in str(p.GetPath()) and p.IsA(UsdGeom.Imageable) \
+                and "/ceiling/" not in str(p.GetParent().GetPath()):
+            UsdGeom.Imageable(p).MakeInvisible()
+            ceilings += 1
+        # Shaders point at "./Materials/<name>.mdl"; Kit 110 cannot resolve that relative module
+        # form ("could not find module ::.::Materials::<name>"), so make the paths absolute.
+        attr = p.GetAttribute("info:mdl:sourceAsset")
+        if attr and attr.IsValid():
+            asset = attr.Get()
+            path = asset.path if asset is not None else ""
+            if path.startswith("./") or path.startswith("../") or (path and not path.startswith("/") and "://" not in path):
+                target = (scene_dir / path).resolve()
+                if target.exists():
+                    attr.Set(Sdf.AssetPath(str(target)))
+                    rewritten += 1
+    if rewritten or ceilings:
+        print(f"grscene: {rewritten} MDL asset paths made absolute, {ceilings} ceiling prims hidden", flush=True)
+    if dome_intensity > 0:
+        dome = UsdLux.DomeLight.Define(world.stage, f"{prim_path}_dome")
+        dome.CreateIntensityAttr(dome_intensity)
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
-    los, his = [], []
+    los, his, backdrops = [], [], 0
     for p in Usd.PrimRange(prim):
         if p.HasAPI(UsdPhysics.CollisionAPI):
             box = cache.ComputeWorldBound(p).ComputeAlignedBox()
             if not box.IsEmpty():
                 los.append(np.array(box.GetMin())); his.append(np.array(box.GetMax()))
+        elif p.IsA(UsdGeom.Mesh):
+            # The scenes carry a 500 m aerial-photo backdrop far below the floor; hide it.
+            box = cache.ComputeWorldBound(p).ComputeAlignedBox()
+            if not box.IsEmpty() and max(np.array(box.GetMax()) - np.array(box.GetMin())) > 60:
+                UsdGeom.Imageable(p).MakeInvisible()
+                backdrops += 1
+    if backdrops:
+        print(f"grscene: {backdrops} backdrop mesh(es) hidden", flush=True)
     if not los:
         raise RuntimeError(f"{usd_name} has no colliders; use the navigation variant")
     lo, hi = np.min(los, axis=0), np.max(his, axis=0)
