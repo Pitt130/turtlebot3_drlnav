@@ -41,6 +41,7 @@ ENABLE_MOTOR_NOISE          = False # Add normally distributed noise to motor ou
 # A shared geometry file lets Gazebo and Isaac use the same arena bounds.
 # With no override, all original settings and Gazebo SDF behavior are retained.
 import os as _os
+TUMBLE_TILT                 = float(_os.environ.get("DRLNAV_TUMBLE_TILT", 0.06))  # rad; real floors with rugs need ~0.26
 if _os.environ.get('DRLNAV_ARENA_CONFIG'):
     from .arena_config import load_arena_config as _load_arena_config
     _arena_config = _load_arena_config(_os.environ['DRLNAV_ARENA_CONFIG'])

@@ -70,6 +70,16 @@ def main():
     parser.add_argument("--usd", required=True)
     parser.add_argument("--scene", choices=["empty", "test_walls"], default="empty")
     parser.add_argument("--stage", type=int, help="build turtlebot3_drl_stage<N> from the Gazebo files")
+    parser.add_argument("--grscene", type=Path, help="GRScenes scene folder: a real apartment instead of a stage")
+    parser.add_argument("--grscene-usd", default="start_result_navigation.usd")
+    parser.add_argument("--start-mode", choices=["random", "fixed"], default="random",
+                        help="grscene: new start pose every task_fail, or one start sampled at launch")
+    parser.add_argument("--goal-min", type=float, default=1.5, help="grscene: goal distance range (m)")
+    parser.add_argument("--goal-max", type=float, default=5.5)
+    parser.add_argument("--path-max", type=float, default=7.0, help="grscene: max grid path length to a goal (m)")
+    parser.add_argument("--inflate", type=float, default=0.25, help="grscene: clearance from obstacles for poses (m)")
+    parser.add_argument("--seed", type=int, help="grscene: seed for start/goal sampling")
+    parser.add_argument("--episode-log", type=Path, help="grscene: CSV of every start and goal")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--physics-hz", type=float, default=PHYSICS_HZ)
     parser.add_argument("--sensor-hz", type=float, default=SENSOR_HZ)
@@ -99,6 +109,13 @@ def main():
         raise SystemExit("The Isaac task controller only implements the stage goal lists; "
                          "ENABLE_TRUE_RANDOM_GOALS and ENABLE_DYNAMIC_GOALS are not supported yet")
     stage_number = args.stage if args.stage is not None else int(os.environ.get("DRLNAV_STAGE", "1"))
+    if args.grscene:
+        # MDL modules are referenced as ::Materials::<name> relative to the scene folder.
+        scene_root = args.grscene.resolve()
+        mdl_paths = [str(scene_root), str(scene_root.parents[1])] + [v for v in [os.environ.get("MDL_SYSTEM_PATH")] if v]
+        os.environ["MDL_SYSTEM_PATH"] = os.pathsep.join(mdl_paths)
+    # The renderer also takes MDL search paths as a setting; both forms are tried.
+    extra = {"extra_args": ["--/renderer/mdl/searchPaths/templates=" + ";".join(mdl_paths)]} if args.grscene else {}
 
     from isaacsim import SimulationApp
     if args.livestream:
@@ -108,7 +125,7 @@ def main():
         w, h = args.view_size
         app = SimulationApp({"headless": True, "hide_ui": args.viewport_only, "width": w, "height": h,
                              "window_width": w, "window_height": h,
-                             "renderer": "RaytracedLighting", "anti_aliasing": 2})
+                             "renderer": "RaytracedLighting", "anti_aliasing": 2, **extra})
         from isaacsim.core.utils.extensions import enable_extension
         stream = "/exts/omni.kit.livestream.app/primaryStream"
         app.set_setting(f"{stream}/streamType", "webrtc")
@@ -121,7 +138,7 @@ def main():
         enable_extension("omni.kit.livestream.app")
         enable_extension("isaacsim.util.debug_draw")
     else:
-        app = SimulationApp({"headless": True})
+        app = SimulationApp({"headless": True, **extra})
 
     import numpy as np
     import rclpy
@@ -144,9 +161,15 @@ def main():
                                   use_sphere_wheel_collisions)
     from turtlebot3_lidar import RANGE_MAX, RANGE_MIN, TurtleBot3Lidar
     from stage_scene import build_in_isaac, load_stage
+    from grscene import StartGoalSampler, build_occupancy, load_grscene
 
     world = World(physics_dt=1 / args.physics_hz, rendering_dt=1 / args.physics_hz)
-    world.scene.add_default_ground_plane()
+    grscene = None
+    if args.grscene:
+        grscene = load_grscene(world, args.grscene, args.grscene_usd)   # has its own floors
+        print(f"grscene {args.grscene.name}: colliders span {np.round(grscene.lo, 2)}..{np.round(grscene.hi, 2)} m", flush=True)
+    else:
+        world.scene.add_default_ground_plane()
     prim = add_reference_to_stage(usd_path=args.usd, prim_path="/World/burger")
     prim.GetVariantSets().GetVariantSet("Physics").SetVariantSelection("physx")
     use_sphere_wheel_collisions(world.stage, "/World/burger")
@@ -168,14 +191,59 @@ def main():
                                                  color=np.array([0.1, 0.8, 0.2])))
     world.reset()
     start_pos, start_quat = robot.get_world_pose()
+    sampler = None
+    if grscene is not None:
+        # Scan with the robot out of the way, then put it on a sampled start.
+        robot.set_world_pose(position=np.array([grscene.lo[0] - 5.0, grscene.lo[1] - 5.0, float(start_pos[2])]))
+        world.step(render=False)
+        t0 = time.time()
+        occupancy = build_occupancy(grscene)
+        sampler = StartGoalSampler(occupancy, inflate=args.inflate, goal_min=args.goal_min, goal_max=args.goal_max,
+                                   path_max=args.path_max, seed=args.seed)
+        print(f"occupancy {occupancy.shape[1]}x{occupancy.shape[0]} cells in {time.time() - t0:.1f} s; "
+              f"usable free area {sampler.area:.1f} m2", flush=True)
+        floor = getattr(occupancy, "floor", 0.0)
+        start_pos = np.array([0.0, 0.0, float(start_pos[2]) + floor])
+
+        def yaw_quat(yaw):
+            return np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
+
+        def place_robot(pos, quat):
+            """Put the robot down and let it settle; True if it stands level at floor height."""
+            robot.set_world_pose(position=pos, orientation=quat)
+            robot.set_linear_velocity(np.zeros(3))
+            robot.set_angular_velocity(np.zeros(3))
+            robot.set_joint_velocities(np.zeros(robot.num_dof))
+            for _ in range(5):
+                world.step(render=False)
+            p, q = robot.get_world_pose()
+            w, x, y, z = (float(v) for v in q)
+            tilt = max(abs(math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))),
+                       abs(math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))))
+            return tilt < math.radians(2) and abs(float(p[2]) - float(pos[2])) < 0.02 and \
+                math.hypot(float(p[0]) - float(pos[0]), float(p[1]) - float(pos[1])) < 0.02
+
+        def sample_valid_start():
+            """A start the robot can actually stand on (the grid misses geometry between cells)."""
+            for _ in range(20):
+                sx, sy, syaw = sampler.sample_start()
+                pos, quat = np.array([sx, sy, float(start_pos[2])]), yaw_quat(syaw)
+                if place_robot(pos, quat):
+                    return pos, quat
+                print(f"start ({sx:.2f}, {sy:.2f}) rejected: robot did not settle level", flush=True)
+            raise RuntimeError("no valid start pose found in 20 tries")
+
+        start_pos, start_quat = sample_valid_start()
     recorder = None
     if args.record:
         from scene_recorder import TopDownRecorder
-        half_width = 1.5
+        half_width, center = 1.5, (0.0, 0.0)
         if stage is not None:
             half_width = max(abs(b.center[i]) + 0.5 * (abs(math.cos(b.yaw)) * b.size[i] + abs(math.sin(b.yaw)) * b.size[1 - i])
                              for b in stage.boxes for i in (0, 1)) + 0.15
-        recorder = TopDownRecorder(world, args.record, half_width, size=args.record_size)
+        if grscene is not None:
+            half_width, center = grscene.half_width, grscene.center
+        recorder = TopDownRecorder(world, args.record, half_width, size=args.record_size, center=center)
         recorder.warm_up()
     wheels = [robot.get_dof_index(n) for n in WHEEL_JOINTS]
     drive = DiffDrive(WHEEL_RADIUS, WHEEL_SEPARATION)
@@ -201,8 +269,12 @@ def main():
         from isaacsim.core.utils.viewports import set_camera_view
         from isaacsim.util.debug_draw import _debug_draw
         draw = _debug_draw.acquire_debug_draw_interface()
-        set_camera_view(eye=np.array([0.0, -4.6, 6.2]), target=np.array([0.0, -0.3, 0.0]),
-                        camera_prim_path="/OmniverseKit_Persp")
+        cam_target, cam_eye = np.array([0.0, -0.3, 0.0]), np.array([0.0, -4.6, 6.2])
+        if grscene is not None:
+            cx, cy = grscene.center
+            cam_target = np.array([cx, cy, 0.0])
+            cam_eye = np.array([cx, cy - 1.1 * grscene.half_width, 1.5 * grscene.half_width])
+        set_camera_view(eye=cam_eye, target=cam_target, camera_prim_path="/OmniverseKit_Persp")
         for _ in range(30):
             world.render()
 
@@ -228,13 +300,33 @@ def main():
 
     goal_pub = node.create_publisher(Pose, "goal_pose", 10)
     rng = goal_rng()
+    episode_log = None
+    if args.episode_log:
+        args.episode_log.parent.mkdir(parents=True, exist_ok=True)
+        episode_log = open(args.episode_log, "a")
+        if args.episode_log.stat().st_size == 0:
+            episode_log.write("episode,sim_time,event,robot_x,robot_y,robot_yaw,goal_x,goal_y\n")
+
+    def robot_xy_yaw():
+        pos, quat = robot.get_world_pose()
+        w, x, y, z = (float(q) for q in quat)
+        return float(pos[0]), float(pos[1]), math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
     def publish_new_goal():
-        state["goal"] = next_goal(stage_number, state["goal"], rng)
-        goal_marker.set_world_pose(position=np.array([*state["goal"], 0.005]))
+        if sampler is not None:
+            rx, ry, _ = robot_xy_yaw()
+            state["goal"] = sampler.sample_goal((rx, ry), state["goal"] if state["episode"] > 1 else None)
+        else:
+            state["goal"] = next_goal(stage_number, state["goal"], rng)
+        goal_marker.set_world_pose(position=np.array([*state["goal"], float(start_pos[2]) - BASE_LINK_HEIGHT + 0.005]))
         msg = Pose()
         msg.position.x, msg.position.y = state["goal"]
         goal_pub.publish(msg)
+        if episode_log is not None:
+            rx, ry, ryaw = robot_xy_yaw()
+            episode_log.write(f"{state['episode']},{state['sim_time']:.3f},{state['last']},{rx:.3f},{ry:.3f},{ryaw:.3f},"
+                              f"{state['goal'][0]:.3f},{state['goal'][1]:.3f}\n")
+            episode_log.flush()
 
     def task_fail(request, response):
         state["anim_offset"] = state["sim_time"]
@@ -246,10 +338,16 @@ def main():
             # does not advance sim time or publish anything.
             move_obstacles(0.0)
             world.step(render=False)
-        robot.set_world_pose(position=start_pos, orientation=start_quat)
-        robot.set_linear_velocity(np.zeros(3))
-        robot.set_angular_velocity(np.zeros(3))
-        robot.set_joint_velocities(np.zeros(robot.num_dof))
+        if sampler is not None and args.start_mode == "random":
+            pos, quat = sample_valid_start()
+            start_pos[:], start_quat[:] = pos, quat
+        elif sampler is not None:
+            place_robot(start_pos, start_quat)
+        else:
+            robot.set_world_pose(position=start_pos, orientation=start_quat)
+            robot.set_linear_velocity(np.zeros(3))
+            robot.set_angular_velocity(np.zeros(3))
+            robot.set_joint_velocities(np.zeros(robot.num_dof))
         drive.stop()
         state["episode"] += 1
         state["last"] = "task_fail"
@@ -362,6 +460,8 @@ def main():
         world.render()
     dt = 1.0 / args.physics_hz
     scene = f"stage{stage.number} ({len(stage.boxes)} walls, {len(stage.obstacles)} obstacles)" if stage else args.scene
+    if grscene is not None:
+        scene = f"grscene {args.grscene.name} ({sampler.area:.0f} m2 free, start {args.start_mode})"
     print(f"isaac_turtlebot3 ready: scene={scene}, physics {args.physics_hz:.0f} Hz, "
           f"sensors {args.physics_hz / sensor_every:.0f} Hz, clock {args.physics_hz / clock_every:.0f} Hz, "
           f"rtf cap {args.rtf or 'none'}, {'running' if state['playing'] else 'paused'}", flush=True)
@@ -410,6 +510,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if episode_log is not None:
+            episode_log.close()
         if recorder is not None:
             recorder.close()
             print(f"recorded {recorder.frames} frames to {args.record}", flush=True)

@@ -47,6 +47,7 @@ from ..common.settings import (
     SUCCESS,
     THRESHOLD_COLLISION,
     THREHSOLD_GOAL,
+    TUMBLE_TILT,
     TIMEOUT,
     TOPIC_ODOM,
     TOPIC_SCAN,
@@ -340,7 +341,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
                 self.succeed = COLLISION_WALL
         elif self.time_sec >= self.episode_deadline:
             self.succeed = TIMEOUT
-        elif self.robot_tilt > 0.06:
+        elif self.robot_tilt > TUMBLE_TILT:
             self.succeed = TUMBLE
 
         if self.succeed != UNKNOWN:
