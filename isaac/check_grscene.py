@@ -27,6 +27,11 @@ def main():
     parser.add_argument("--goal-max", type=float, default=5.5)
     parser.add_argument("--model", help="SB3 TD3 zip: drive with this policy (deterministic) instead of random actions")
     parser.add_argument("--track-out", help="CSV of every step: episode, x, y, tilt_deg, outcome")
+    parser.add_argument("--waypoints", type=float, metavar="LOOKAHEAD",
+                        help="hierarchical: plan on the scene occupancy grid and give the policy a waypoint this "
+                             "far along the path instead of the goal (needs --model and --scene)")
+    parser.add_argument("--scene", help="GRScenes scene folder (for --waypoints): its occupancy_v2_*.npz is used")
+    parser.add_argument("--plan-inflate", type=float, default=0.18)
     args = parser.parse_args()
     env = make_env(step_sim_time=0.1)
     rng = np.random.default_rng(0)
@@ -36,6 +41,16 @@ def main():
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "sb3"))   # tomas_policy
         from stable_baselines3 import TD3
         policy = TD3.load(args.model, device="cuda")
+    planner = None
+    if args.waypoints:
+        import glob, sys
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+        from grscene import Occupancy
+        from waypoints import WaypointPlanner
+        from turtlebot3_drl.drl_environment.drl_environment_gymnasium import MAX_GOAL_DISTANCE
+        occ = Occupancy.load(sorted(glob.glob(f"{args.scene}/occupancy_v2_*.npz"))[0])
+        planner = WaypointPlanner(occ, inflate=args.plan_inflate, lookahead=args.waypoints)
+        print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m", flush=True)
     track_file = open(args.track_out, "w") if args.track_out else None
     if track_file:
         track_file.write("episode,step,x,y,tilt_deg,min_obstacle,goal_distance,lin,ang,outcome\n")
@@ -53,8 +68,18 @@ def main():
         goals.append((env.goal_x, env.goal_y))
         min_scans.append(min(env.scan_ranges) * 3.5)
         n, max_tilt, tilt_at, track = 0, 0.0, None, []
+        unreachable = 0
+        if planner is not None:
+            planner.set_goal(env.goal_x, env.goal_y)
         while True:
-            action = policy.predict(obs, deterministic=True)[0] if policy is not None else rng.uniform(-1, 1, 2).astype(np.float32)
+            if planner is not None:
+                wx, wy, ok = planner.waypoint(env.robot_x, env.robot_y)
+                unreachable += not ok
+                policy_obs = planner.observation_with(obs, env.robot_x, env.robot_y, env.robot_heading, wx, wy,
+                                                      MAX_GOAL_DISTANCE)
+            else:
+                policy_obs = obs
+            action = policy.predict(policy_obs, deterministic=True)[0] if policy is not None else rng.uniform(-1, 1, 2).astype(np.float32)
             obs, r, term, trunc, info = env.step(action)
             dts.append(info["step_sim_dt"]); n += 1
             track.append((round(env.robot_x, 3), round(env.robot_y, 3), round(math.degrees(env.robot_tilt), 2)))
@@ -70,7 +95,8 @@ def main():
         d = math.hypot(goals[-1][0] - starts[-1][0], goals[-1][1] - starts[-1][1])
         print(f"episode {ep + 1:2d}: start ({starts[-1][0]:+.2f},{starts[-1][1]:+.2f}) goal ({goals[-1][0]:+.2f},"
               f"{goals[-1][1]:+.2f}) dist {d:.2f} m, min scan at start {min_scans[-1]:.2f} m -> {outcomes[-1]} after {n} steps"
-              f"; max tilt {math.degrees(max_tilt):.1f} deg at ({tilt_at[0]:+.2f},{tilt_at[1]:+.2f})", flush=True)
+              f"; max tilt {math.degrees(max_tilt):.1f} deg at ({tilt_at[0]:+.2f},{tilt_at[1]:+.2f})"
+              + (f"; waypoint unreachable {unreachable} steps" if planner is not None and unreachable else ""), flush=True)
         if outcomes[-1] == "TUMBLE":
             print("   last 8 steps (x, y, tilt deg):", track[-8:], flush=True)
     env.close()
