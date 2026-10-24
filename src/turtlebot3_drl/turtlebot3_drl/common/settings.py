@@ -1,3 +1,4 @@
+import os as _os
 # ===================================================================== #
 #                           GENERAL SETTINGS                            #
 # ===================================================================== #
@@ -40,7 +41,6 @@ ENABLE_MOTOR_NOISE          = False # Add normally distributed noise to motor ou
 
 # A shared geometry file lets Gazebo and Isaac use the same arena bounds.
 # With no override, all original settings and Gazebo SDF behavior are retained.
-import os as _os
 TUMBLE_TILT                 = float(_os.environ.get("DRLNAV_TUMBLE_TILT", 0.06))  # rad; real floors with rugs need ~0.26
 if _os.environ.get('DRLNAV_ARENA_CONFIG'):
     from .arena_config import load_arena_config as _load_arena_config
@@ -76,7 +76,7 @@ REAL_THRESHOLD_GOAL         = 0.35  # meters, minimum distance to goal that coun
 # ===================================================================== #
 
 # DRL parameters
-REWARD_FUNCTION = "A"       # Defined in reward.py
+REWARD_FUNCTION = _os.environ.get("DRLNAV_REWARD", "A")   # Defined in reward.py; B for indoor scenes
 ACTION_SIZE     = 2         # Not used for DQN, see DQN_ACTION_SIZE
 HIDDEN_SIZE     = 512       # Number of neurons in hidden layers
 
