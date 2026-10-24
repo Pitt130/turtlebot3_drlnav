@@ -72,6 +72,26 @@ class WaypointPlanner:
         x, y = self.occ.to_world(r, c)
         return x, y, True
 
+    def path_length(self, rx, ry):
+        """Length (m) of the grid path from (rx, ry) to the goal, following the distance field."""
+        r, c = self.nearest_free(*self.occ.to_cell(rx, ry))
+        if not np.isfinite(self.dist[r, c]):
+            return math.inf
+        length = 0.0
+        while self.dist[r, c] > 0:
+            best, best_d = None, self.dist[r, c]
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    rr, cc = r + dr, c + dc
+                    if (dr or dc) and 0 <= rr < self.free.shape[0] and 0 <= cc < self.free.shape[1] \
+                            and self.dist[rr, cc] < best_d:
+                        best, best_d = (rr, cc), self.dist[rr, cc]
+            if best is None:
+                break
+            length += self.occ.cell * math.hypot(best[0] - r, best[1] - c)
+            r, c = best
+        return length
+
     @staticmethod
     def observation_with(obs, rx, ry, heading, wx, wy, max_goal_distance):
         """Copy of the env observation with the goal distance/angle entries pointing at (wx, wy)."""

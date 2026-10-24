@@ -80,6 +80,9 @@ def main():
     parser.add_argument("--inflate", type=float, default=0.25, help="grscene: clearance from obstacles for poses (m)")
     parser.add_argument("--seed", type=int, help="grscene: seed for start/goal sampling")
     parser.add_argument("--episode-log", type=Path, help="grscene: CSV of every start and goal")
+    parser.add_argument("--reset-every-episode", action="store_true",
+                        help="grscene: also put the robot on a new start after task_succeed, so the sequence of "
+                             "start/goal tasks depends only on --seed and policies can be compared on the same tasks")
     parser.add_argument("--low-rays", type=float, default=0.0, metavar="HEIGHT",
                         help="add world-horizontal rays this high above the floor and take the per-ray minimum "
                              "with the LDS, so furniture bases and shoes below the 17 cm scan plane are seen (0 = off)")
@@ -195,6 +198,11 @@ def main():
     # A 2 m pole over the goal, so it stays visible behind furniture in the livestream (visual only).
     goal_pole = world.scene.add(VisualCylinder(prim_path="/World/goal_pole", name="goal_pole", radius=0.03, height=2.0,
                                                position=np.array([*INITIAL_GOAL, 1.0]), color=np.array([0.1, 0.9, 0.2])))
+    # Hierarchical navigation: the waypoint a planner hands the policy (published on `waypoint`), shown
+    # as a shorter yellow pole; parked below the floor until the first waypoint arrives.
+    waypoint_pole = world.scene.add(VisualCylinder(prim_path="/World/waypoint_pole", name="waypoint_pole", radius=0.025,
+                                                   height=0.8, position=np.array([0.0, 0.0, -5.0]),
+                                                   color=np.array([1.0, 0.8, 0.0])))
     world.reset()
     start_pos, start_quat = robot.get_world_pose()
     sampler = None
@@ -297,6 +305,8 @@ def main():
     # gazebo_ros_p3d on each obstacle: /obstacle/odom, world frame, scoped link name.
     obstacle_pub = node.create_publisher(Odometry, "/obstacle/odom", 10)
     node.create_subscription(Twist, "cmd_vel", lambda m: drive.command(m.linear.x, m.angular.z), 10)
+    node.create_subscription(Pose, "waypoint", lambda m: waypoint_pole.set_world_pose(
+        position=np.array([m.position.x, m.position.y, float(start_pos[2]) - BASE_LINK_HEIGHT + 0.4])), 10)
 
     def set_playing(playing):
         def callback(request, response):
@@ -365,6 +375,13 @@ def main():
         return response
 
     def task_succeed(request, response):
+        if sampler is not None and args.reset_every_episode:
+            if args.start_mode == "random":
+                pos, quat = sample_valid_start()
+                start_pos[:], start_quat[:] = pos, quat
+            else:
+                place_robot(start_pos, start_quat)
+            drive.stop()
         state["episode"] += 1
         state["last"] = "task_succeed"
         publish_new_goal()
