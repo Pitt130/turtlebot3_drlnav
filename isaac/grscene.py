@@ -185,11 +185,14 @@ class GRScene:
 
 
 def load_grscene(world, scene_dir, usd_name="start_result_navigation.usd", prim_path="/World/grscene",
-                 hide_ceilings=True, dome_intensity=1000.0):
+                 hide_ceilings=True, dome_intensity=1000.0, drive_over=("blanket",), drive_over_height=0.05):
     """Reference the scene (centimetres -> metres), disable its own physics scene, return its collider bounds.
 
     Ceilings are hidden (render only; their colliders are 2.8 m up and irrelevant to the robot) so
     top-down views show the rooms, and a dome light is added because the scene's own lights are dim.
+    Colliders of `drive_over` categories that lie within `drive_over_height` of the floor (rugs, which
+    the dataset files under "blanket") are disabled: a 1.5 cm rug edge stops the Burger's 1 cm caster
+    ball in PhysX, where a real rug gives way, and it tilts the robot into the tumble test.
     """
     from isaacsim.core.utils.stage import add_reference_to_stage
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
@@ -246,6 +249,15 @@ def load_grscene(world, scene_dir, usd_name="start_result_navigation.usd", prim_
     lo, hi = np.min(los, axis=0), np.max(his, axis=0)
     if max(hi[:2] - lo[:2]) > 100:
         raise RuntimeError(f"scene spans {hi - lo} m after scaling by {scale}; check the layer units")
+    rugs = 0
+    for p in Usd.PrimRange(prim):
+        if p.HasAPI(UsdPhysics.CollisionAPI) and any(f"/{c}/" in str(p.GetPath()) for c in drive_over):
+            box = cache.ComputeWorldBound(p).ComputeAlignedBox()
+            if not box.IsEmpty() and box.GetMax()[2] - lo[2] < drive_over_height:
+                UsdPhysics.CollisionAPI(p).GetCollisionEnabledAttr().Set(False)
+                rugs += 1
+    if rugs:
+        print(f"grscene: {rugs} floor-level {'/'.join(drive_over)} colliders disabled (driven over)", flush=True)
     return GRScene(prim_path, lo, hi, scene_dir)
 
 

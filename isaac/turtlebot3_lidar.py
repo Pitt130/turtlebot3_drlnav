@@ -3,6 +3,12 @@
 Mirrors the Gazebo ray sensor in turtlebot3_burger/model.sdf: rays in the
 base_scan plane, range 0.12-3.5 m, Gaussian noise (stddev 0.01) clamped to the
 range, no return reported as +inf (REP-117), 50 Hz.
+
+LowRayLayer adds a second, world-horizontal set of rays close to the floor for
+furnished scenes: sofa, bed and cabinet bases sit below the 17 cm scan plane, so
+the LDS alone lets the robot push against them until the episode times out.
+Combined per ray with min(), the scan keeps its 40-ray layout; in the box
+arenas (full-height walls) it is unchanged.
 """
 import math
 
@@ -35,6 +41,7 @@ class TurtleBot3Lidar:
         ))
         self.noise_stddev = float(noise_stddev)
         self.rng = np.random.default_rng(seed)
+        self.low = None
 
     def raw(self):
         """Depths as reported by the sensor plus hit positions, for checks."""
@@ -42,10 +49,42 @@ class TurtleBot3Lidar:
         return np.asarray(frame["depths"], dtype=np.float64), frame
 
     def ranges(self):
-        """LaserScan ranges with Gazebo semantics."""
+        """LaserScan ranges with Gazebo semantics (plus the low layer when attached)."""
         depths, frame = self.raw()
+        if self.low is not None:
+            depths = np.minimum(depths, self.low.depths(self.angles))
         hit = np.isfinite(depths) & (depths >= RANGE_MIN) & (depths < RANGE_MAX)
         out = np.full(depths.shape, math.inf)
         noisy = depths[hit] + (self.rng.normal(0.0, self.noise_stddev, hit.sum()) if self.noise_stddev else 0.0)
         out[hit] = np.clip(noisy, RANGE_MIN, RANGE_MAX)
         return out, float(frame["time"])
+
+
+class LowRayLayer:
+    """World-horizontal raycasts at a fixed height above the floor, from the scan origin.
+
+    Cast with PhysX scene queries rather than a sensor on the robot, so a robot
+    tilted by a rug edge does not see the floor as a wall. Hits on the robot
+    itself are ignored.
+    """
+
+    def __init__(self, robot, floor_z, height=0.06, scan_offset=-0.032, ignore_prefix="/World/burger"):
+        from omni.physx import get_physx_scene_query_interface
+        self.robot, self.z, self.scan_offset, self.ignore = robot, floor_z + height, scan_offset, ignore_prefix
+        self.pq = get_physx_scene_query_interface()
+
+    def depths(self, angles):
+        from pxr import Gf
+        pos, quat = self.robot.get_world_pose()
+        w, x, y, z = (float(q) for q in quat)
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        ox, oy = float(pos[0]) + self.scan_offset * math.cos(yaw), float(pos[1]) + self.scan_offset * math.sin(yaw)
+        origin = Gf.Vec3f(ox, oy, self.z)
+        out = np.full(len(angles), math.inf)
+        for i, a in enumerate(angles):
+            d = Gf.Vec3f(math.cos(yaw + a), math.sin(yaw + a), 0.0)
+            r = self.pq.raycast_closest(origin, d, RANGE_MAX)
+            if r["hit"] and not (str(r.get("rigidBody") or "").startswith(self.ignore)
+                                 or str(r.get("collision") or "").startswith(self.ignore)):
+                out[i] = r["distance"]
+        return out

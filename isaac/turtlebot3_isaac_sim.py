@@ -80,6 +80,9 @@ def main():
     parser.add_argument("--inflate", type=float, default=0.25, help="grscene: clearance from obstacles for poses (m)")
     parser.add_argument("--seed", type=int, help="grscene: seed for start/goal sampling")
     parser.add_argument("--episode-log", type=Path, help="grscene: CSV of every start and goal")
+    parser.add_argument("--low-rays", type=float, default=0.0, metavar="HEIGHT",
+                        help="add world-horizontal rays this high above the floor and take the per-ray minimum "
+                             "with the LDS, so furniture bases and shoes below the 17 cm scan plane are seen (0 = off)")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--physics-hz", type=float, default=PHYSICS_HZ)
     parser.add_argument("--sensor-hz", type=float, default=SENSOR_HZ)
@@ -159,7 +162,7 @@ def main():
     from isaacsim.core.utils.types import ArticulationAction
     from build_turtlebot3 import (WHEEL_JOINTS, WHEEL_RADIUS, WHEEL_SEPARATION, apply_contact_materials,
                                   use_sphere_wheel_collisions)
-    from turtlebot3_lidar import RANGE_MAX, RANGE_MIN, TurtleBot3Lidar
+    from turtlebot3_lidar import RANGE_MAX, RANGE_MIN, LowRayLayer, TurtleBot3Lidar
     from stage_scene import build_in_isaac, load_stage
     from grscene import StartGoalSampler, build_occupancy, load_grscene
 
@@ -189,6 +192,9 @@ def main():
     goal_marker = world.scene.add(VisualCylinder(prim_path="/World/goal", name="goal", radius=0.3, height=0.01,
                                                  position=np.array([*INITIAL_GOAL, 0.005]),
                                                  color=np.array([0.1, 0.8, 0.2])))
+    # A 2 m pole over the goal, so it stays visible behind furniture in the livestream (visual only).
+    goal_pole = world.scene.add(VisualCylinder(prim_path="/World/goal_pole", name="goal_pole", radius=0.03, height=2.0,
+                                               position=np.array([*INITIAL_GOAL, 1.0]), color=np.array([0.1, 0.9, 0.2])))
     world.reset()
     start_pos, start_quat = robot.get_world_pose()
     sampler = None
@@ -204,6 +210,9 @@ def main():
               f"usable free area {sampler.area:.1f} m2", flush=True)
         floor = getattr(occupancy, "floor", 0.0)
         start_pos = np.array([0.0, 0.0, float(start_pos[2]) + floor])
+        if args.low_rays > 0:
+            lidar.low = LowRayLayer(robot, floor, height=args.low_rays, scan_offset=SCAN_OFFSET)
+            print(f"low ray layer at {args.low_rays:.2f} m above the floor", flush=True)
 
         def yaw_quat(yaw):
             return np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
@@ -319,6 +328,7 @@ def main():
         else:
             state["goal"] = next_goal(stage_number, state["goal"], rng)
         goal_marker.set_world_pose(position=np.array([*state["goal"], float(start_pos[2]) - BASE_LINK_HEIGHT + 0.005]))
+        goal_pole.set_world_pose(position=np.array([*state["goal"], float(start_pos[2]) - BASE_LINK_HEIGHT + 1.0]))
         msg = Pose()
         msg.position.x, msg.position.y = state["goal"]
         goal_pub.publish(msg)

@@ -84,11 +84,10 @@ def main():
     report("every step advances 0.1 s", all(abs(d - 0.1) < 1e-6 for d in dts), f"({len(dts)} steps)")
     report("no tumble", "TUMBLE" not in outcomes, f"(outcomes {dict((o, outcomes.count(o)) for o in set(outcomes))})")
     if args.log:
-        rows = list(csv.DictReader(open(args.log)))
-        fails = [r for r in rows if r["event"] == "task_fail"][-args.episodes:]
+        rows = list(csv.DictReader(open(args.log)))[-args.episodes:]      # task_fail and task_succeed alike
         match = all(abs(float(r["goal_x"]) - g[0]) < 1e-3 and abs(float(r["goal_y"]) - g[1]) < 1e-3
-                    for r, g in zip(fails, goals)) if len(fails) == len(goals) else False
-        report("episode log matches the env's goals", match, f"({len(fails)} logged task_fail rows)")
+                    for r, g in zip(rows, goals)) if len(rows) == len(goals) else False
+        report("episode log matches the env's goals", match, f"({len(rows)} logged rows)")
     print("GRSCENE CHECK PASS" if ok else "GRSCENE CHECK FAIL", flush=True)
 
 
