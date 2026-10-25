@@ -30,8 +30,11 @@ def main():
     parser.add_argument("--waypoints", type=float, metavar="LOOKAHEAD",
                         help="hierarchical: plan on the scene occupancy grid and give the policy a waypoint this "
                              "far along the path instead of the goal (needs --model and --scene)")
-    parser.add_argument("--scene", help="GRScenes scene folder (for --waypoints): its occupancy_v2_*.npz is used")
+    parser.add_argument("--scene", help="GRScenes scene folder (for --waypoints): its occupancy_v3_*.npz is used")
     parser.add_argument("--plan-inflate", type=float, default=0.18)
+    parser.add_argument("--plan-low-inflate", type=float, help="planning margin around obstacles below the lidar plane")
+    parser.add_argument("--stall-recovery", action="store_true",
+                        help="move the waypoint 1.5 m ahead for 2 s after 3 s without 0.1 m of path progress")
     parser.add_argument("--path-timeout", type=float, metavar="K",
                         help="episode time limit max(EPISODE_TIMEOUT_SECONDS, K * grid path length / max speed) "
                              "instead of the fixed limit (needs --scene)")
@@ -52,10 +55,13 @@ def main():
         from waypoints import WaypointPlanner
         from turtlebot3_drl.common.settings import EPISODE_TIMEOUT_SECONDS, SPEED_LINEAR_MAX
         from turtlebot3_drl.drl_environment.drl_environment_gymnasium import MAX_GOAL_DISTANCE
-        occ = Occupancy.load(sorted(glob.glob(f"{args.scene}/occupancy_v2_*.npz"))[0])
-        planner = WaypointPlanner(occ, inflate=args.plan_inflate, lookahead=args.waypoints or 1.5)
+        occ = Occupancy.load(sorted(glob.glob(f"{args.scene}/occupancy_v4_*.npz"))[0])
+        planner = WaypointPlanner(occ, inflate=args.plan_inflate, lookahead=args.waypoints or 1.5,
+                                  low_inflate=args.plan_low_inflate)
         if args.waypoints:
-            print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m", flush=True)
+            print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m"
+                  f" (below-lidar obstacles {args.plan_low_inflate or args.plan_inflate} m),"
+                  f" stall recovery {'on' if args.stall_recovery else 'off'}", flush=True)
             from geometry_msgs.msg import Pose
             waypoint_pub = env.create_publisher(Pose, "waypoint", 10)     # for the runtime's marker
         if args.path_timeout:
@@ -70,7 +76,7 @@ def main():
         ok &= passed
         print(f"[{'PASS' if passed else 'FAIL'}] {label} {detail}", flush=True)
 
-    starts, goals, min_scans, dts, outcomes, lengths = [], [], [], [], [], []
+    starts, goals, min_scans, dts, outcomes, lengths, stalls = [], [], [], [], [], [], []
     for ep in range(args.episodes):
         obs, info = env.reset()
         starts.append((env.robot_x, env.robot_y))
@@ -80,13 +86,17 @@ def main():
         unreachable, path_len = 0, math.nan
         if planner is not None:
             planner.set_goal(env.goal_x, env.goal_y)
+            planner.reset_progress()
             path_len = planner.path_length(env.robot_x, env.robot_y)
             if args.path_timeout and math.isfinite(path_len):
                 env.episode_deadline = env.time_sec + max(EPISODE_TIMEOUT_SECONDS,
                                                           args.path_timeout * path_len / SPEED_LINEAR_MAX)
         while True:
             if args.waypoints:
-                wx, wy, reachable = planner.waypoint(env.robot_x, env.robot_y)
+                if args.stall_recovery:
+                    wx, wy, reachable, _ = planner.step(env.robot_x, env.robot_y)
+                else:
+                    wx, wy, reachable = planner.waypoint(env.robot_x, env.robot_y)
                 unreachable += not reachable
                 msg = Pose()
                 msg.position.x, msg.position.y = float(wx), float(wy)
@@ -108,12 +118,14 @@ def main():
             if term or trunc:
                 break
         outcomes.append(NAMES[int(info["success"])]); lengths.append(n)
+        stalls.append(planner.stalls if planner is not None else 0)
         d = math.hypot(goals[-1][0] - starts[-1][0], goals[-1][1] - starts[-1][1])
         print(f"episode {ep + 1:2d}: start ({starts[-1][0]:+.2f},{starts[-1][1]:+.2f}) goal ({goals[-1][0]:+.2f},"
               f"{goals[-1][1]:+.2f}) dist {d:.2f} m, min scan at start {min_scans[-1]:.2f} m -> {outcomes[-1]} after {n} steps"
               f"; max tilt {math.degrees(max_tilt):.1f} deg at ({tilt_at[0]:+.2f},{tilt_at[1]:+.2f})"
               + (f"; path {path_len:.2f} m" if planner is not None else "")
-              + (f"; waypoint unreachable {unreachable} steps" if unreachable else ""), flush=True)
+              + (f"; waypoint unreachable {unreachable} steps" if unreachable else "")
+              + (f"; path_blocked {stalls[-1]}" if stalls[-1] else ""), flush=True)
         if outcomes[-1] == "TUMBLE":
             print("   last 8 steps (x, y, tilt deg):", track[-8:], flush=True)
     env.close()
@@ -133,7 +145,7 @@ def main():
         report("episode log matches the env's goals", match, f"({len(rows)} logged rows)")
     counts = {o: outcomes.count(o) for o in NAMES.values() if outcomes.count(o)}
     print(f"SUMMARY episodes={len(outcomes)} success={100 * outcomes.count('SUCCESS') / len(outcomes):.1f}% "
-          f"mean_steps={np.mean(lengths):.0f} {counts}", flush=True)
+          f"mean_steps={np.mean(lengths):.0f} {counts} path_blocked_episodes={sum(s > 0 for s in stalls)}", flush=True)
     print("GRSCENE CHECK PASS" if ok else "GRSCENE CHECK FAIL", flush=True)
 
 

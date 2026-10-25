@@ -52,7 +52,10 @@ class TurtleBot3Lidar:
         """LaserScan ranges with Gazebo semantics (plus the low layer when attached)."""
         depths, frame = self.raw()
         if self.low is not None:
-            depths = np.minimum(depths, self.low.depths(self.angles))
+            # A low obstacle closer than range_min is already under the robot front (a shoe the
+            # wheels ride onto); report it at range_min so it reads as contact, not as no return.
+            low = self.low.depths(self.angles)
+            depths = np.minimum(depths, np.where(np.isfinite(low), np.maximum(low, RANGE_MIN), np.inf))
         hit = np.isfinite(depths) & (depths >= RANGE_MIN) & (depths < RANGE_MAX)
         out = np.full(depths.shape, math.inf)
         noisy = depths[hit] + (self.rng.normal(0.0, self.noise_stddev, hit.sum()) if self.noise_stddev else 0.0)

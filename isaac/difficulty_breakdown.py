@@ -21,7 +21,7 @@ BINS = ((1.0, 1.25, "nearly straight"), (1.25, 1.7, "around furniture"), (1.7, 9
 
 def main():
     scene_dir, runs = sys.argv[1], sys.argv[2:]
-    occ = grscene.Occupancy.load(sorted(glob.glob(f"{scene_dir}/occupancy_v2_*.npz"))[0])
+    occ = grscene.Occupancy.load(sorted(glob.glob(f"{scene_dir}/occupancy_v4_*.npz"))[0])
     grid = grscene.StartGoalSampler(occ, inflate=0.25).occ
     for spec in runs:
         label, run_dir = spec.split("=", 1)

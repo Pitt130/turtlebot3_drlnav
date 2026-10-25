@@ -16,10 +16,19 @@ from grscene import FREE
 
 
 class WaypointPlanner:
-    def __init__(self, occupancy, inflate=0.18, lookahead=1.5, final_within=1.2):
+    def __init__(self, occupancy, inflate=0.18, lookahead=1.5, final_within=1.2, low_inflate=None,
+                 stall_steps=30, stall_gain=0.10, recover_steps=20, recover_lookahead=1.5):
         """`occupancy` is the raw grid; it is inflated by `inflate` (less than the sampler's
-        0.25 m, so paths exist along furniture the policy can still pass)."""
-        self.occ = occupancy.inflated(inflate)
+        0.25 m, so paths exist along furniture the policy can still pass) and LOW cells (below the
+        lidar plane, invisible to the policy) by `low_inflate`.
+
+        Stall recovery (step()): when the path length to the goal has not dropped by `stall_gain`
+        for `stall_steps` control steps, the waypoint moves `recover_lookahead` ahead for
+        `recover_steps` steps, and the stall is counted (the path_blocked signal)."""
+        self.occ = occupancy.inflated_split(inflate, low_inflate) if low_inflate else occupancy.inflated(inflate)
+        self.stall_steps, self.stall_gain = stall_steps, stall_gain
+        self.recover_steps, self.recover_lookahead = recover_steps, recover_lookahead
+        self.reset_progress()
         self.free = self.occ.grid == FREE
         self.lookahead, self.final_within = lookahead, final_within
         self.free_cells = np.argwhere(self.free)
@@ -42,7 +51,25 @@ class WaypointPlanner:
         self.dist = self.occ.path_steps(r, c, max_steps=self.free.shape[0] + self.free.shape[1])
         self.replans += 1
 
-    def waypoint(self, rx, ry):
+    def reset_progress(self):
+        self.best, self.since, self.recovering, self.stalls = math.inf, 0, 0, 0
+
+    def step(self, rx, ry):
+        """waypoint() with stall recovery; returns (x, y, reachable, recovering)."""
+        length = self.path_length(rx, ry)
+        if length < self.best - self.stall_gain:
+            self.best, self.since = length, 0
+        else:
+            self.since += 1
+        if self.recovering:
+            self.recovering -= 1
+        elif self.since >= self.stall_steps:
+            self.recovering, self.since, self.best = self.recover_steps, 0, length
+            self.stalls += 1
+        x, y, ok = self.waypoint(rx, ry, self.recover_lookahead if self.recovering else None)
+        return x, y, ok, bool(self.recovering)
+
+    def waypoint(self, rx, ry, lookahead=None):
         """World (x, y) about `lookahead` m along the grid path from the robot, or the goal when close.
 
         Returns (x, y, reachable). Unreachable (robot cut off from the goal on the grid)
@@ -55,7 +82,8 @@ class WaypointPlanner:
         if not np.isfinite(self.dist[r, c]):
             return gx, gy, False
         travelled, cell = 0.0, self.occ.cell
-        while travelled < self.lookahead:
+        lookahead = self.lookahead if lookahead is None else lookahead
+        while travelled < lookahead:
             best, best_d = None, self.dist[r, c]
             for dr in (-1, 0, 1):
                 for dc in (-1, 0, 1):

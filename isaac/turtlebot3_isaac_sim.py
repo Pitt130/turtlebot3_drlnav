@@ -333,7 +333,13 @@ def main():
 
     def publish_new_goal():
         if sampler is not None:
-            rx, ry, _ = robot_xy_yaw()
+            # After a reset, draw from the sampled start, not from where the robot settled: the settled
+            # pose differs by millimetres between runs, which could change the goal, so policies would
+            # no longer be compared on the same tasks.
+            if state["last"] == "task_fail" or args.reset_every_episode:
+                rx, ry = float(start_pos[0]), float(start_pos[1])
+            else:
+                rx, ry, _ = robot_xy_yaw()
             state["goal"] = sampler.sample_goal((rx, ry), state["goal"] if state["episode"] > 1 else None)
         else:
             state["goal"] = next_goal(stage_number, state["goal"], rng)

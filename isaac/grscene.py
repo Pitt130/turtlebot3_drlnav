@@ -17,12 +17,25 @@ from pathlib import Path
 import numpy as np
 
 LIDAR_HEIGHT = 0.172        # base_scan above the floor
-FREE, OCCUPIED, OUTSIDE = 0, 1, 2
+FREE, OCCUPIED, OUTSIDE, LOW = 0, 1, 2, 3   # LOW: an object below the lidar plane (shoes, steps)
+
+
+def _dilate(mask, n, pad):
+    """Boolean disc dilation by n cells; `pad` is the value assumed outside the grid."""
+    padded = np.pad(mask, n, constant_values=pad)
+    out = np.zeros_like(mask)
+    rows, cols = mask.shape
+    for dr in range(-n, n + 1):
+        for dc in range(-n, n + 1):
+            if dr * dr + dc * dc <= n * n:
+                out |= padded[n + dr:n + dr + rows, n + dc:n + dc + cols]
+    return out
 
 
 @dataclass
 class Occupancy:
-    """Cells at the lidar height: FREE, OCCUPIED (something within one cell) or OUTSIDE (no floor)."""
+    """Cells at the lidar height: FREE, OCCUPIED (something within one cell at the lidar height),
+    LOW (something on the floor but entirely below the lidar plane) or OUTSIDE (no floor)."""
     origin: tuple           # world (x, y) of the centre of cell [0, 0]
     cell: float             # metres
     grid: np.ndarray        # [row (y), col (x)] uint8
@@ -48,6 +61,16 @@ class Occupancy:
             for dc in range(-n, n + 1):
                 if dr * dr + dc * dc <= n * n:
                     grown |= padded[n + dr:n + dr + rows, n + dc:n + dc + cols]
+        out = self.grid.copy()
+        out[grown & (self.grid == FREE)] = OCCUPIED
+        return Occupancy(self.origin, self.cell, out)
+
+    def inflated_split(self, radius, low_radius):
+        """Like inflated(), but LOW cells get their own margin: the lidar cannot see them, so the
+        planner has to keep the robot farther away than from walls the policy avoids by itself."""
+        visible = (self.grid != FREE) & (self.grid != LOW)
+        grown = _dilate(visible, int(math.ceil(radius / self.cell)), True) | \
+            _dilate(self.grid == LOW, int(math.ceil(low_radius / self.cell)), False)
         out = self.grid.copy()
         out[grown & (self.grid == FREE)] = OCCUPIED
         return Occupancy(self.origin, self.cell, out)
@@ -111,6 +134,7 @@ class Occupancy:
         img[self.grid == FREE] = (235, 235, 235)
         img[self.grid == OCCUPIED] = (30, 30, 30)
         img[self.grid == OUTSIDE] = (90, 120, 160)
+        img[self.grid == LOW] = (230, 140, 30)
         for x, y, color in marks:
             r, c = self.to_cell(x, y)
             img[max(0, r - 2):r + 3, max(0, c - 2):c + 3] = color
@@ -261,12 +285,14 @@ def load_grscene(world, scene_dir, usd_name="start_result_navigation.usd", prim_
     return GRScene(prim_path, lo, hi, scene_dir)
 
 
-def build_occupancy(scene, cell=0.05, lidar_z=LIDAR_HEIGHT, ignore_prefix="/World/burger", cache=True):
+def build_occupancy(scene, cell=0.05, lidar_z=LIDAR_HEIGHT, ignore_prefix="/World/burger", cache=True,
+                    low_object=0.005):
     """Scan the loaded scene with physics raycasts (after world.reset()). Cached next to the USD."""
     from pxr import Gf
     from omni.physx import get_physx_scene_query_interface
 
-    path = scene.scene_dir / f"occupancy_v2_{int(round(cell * 100))}cm_{int(round(lidar_z * 1000))}mm.npz"
+    path = scene.scene_dir / (f"occupancy_v4_{int(round(cell * 100))}cm_{int(round(lidar_z * 1000))}mm_"
+                              f"{int(round(low_object * 1000))}mm.npz")
     if cache and path.exists():
         return Occupancy.load(path)
     pq = get_physx_scene_query_interface()
@@ -295,13 +321,14 @@ def build_occupancy(scene, cell=0.05, lidar_z=LIDAR_HEIGHT, ignore_prefix="/Worl
             under = cast((x, y, z), (0, 0, -1), lidar_z + 0.5)
             if under is None:
                 continue                           # no floor under this cell
-            if under > floor + 0.03:               # step, low furniture: below the lidar and not drivable
-                grid[j, i] = OCCUPIED              # (rugs of 1-2 cm are driven over, tilting the robot 4-6 deg)
+            if any(cast((x, y, z), d, cell) is not None for d in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0))):
+                grid[j, i] = OCCUPIED              # seen by the lidar
+            elif under > floor + low_object:       # shoes, steps: below the lidar plane, not drivable
+                grid[j, i] = LOW                   # (rug colliders are disabled, so rays pass through rugs)
                 low += 1
-                continue
-            grid[j, i] = OCCUPIED if any(cast((x, y, z), d, cell) is not None
-                                         for d in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0))) else FREE
-    print(f"occupancy: floor z {floor:.3f} m, {low} cells on low objects marked occupied", flush=True)
+            else:
+                grid[j, i] = FREE
+    print(f"occupancy: floor z {floor:.3f} m, {low} cells on objects below the lidar plane", flush=True)
     occ = Occupancy((float(lo[0]), float(lo[1])), cell, grid)
     occ.floor = floor
     if cache:
