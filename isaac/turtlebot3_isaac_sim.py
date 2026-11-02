@@ -83,9 +83,31 @@ def main():
     parser.add_argument("--reset-every-episode", action="store_true",
                         help="grscene: also put the robot on a new start after task_succeed, so the sequence of "
                              "start/goal tasks depends only on --seed and policies can be compared on the same tasks")
+    parser.add_argument("--lidar-samples", type=int, default=40,
+                        help="LDS rays per turn; 40 keeps Gazebo's layout, 360 is the real LDS (1 degree), "
+                             "for DRLNAV_SCAN_POOL=min")
+    parser.add_argument("--low-rays-every", type=int, default=1, metavar="K",
+                        help="cast the low layer at every K-th LDS angle (each one is a Python raycast; "
+                             "K=3 with --lidar-samples 360 keeps 3 degrees)")
     parser.add_argument("--low-rays", type=float, default=0.0, metavar="HEIGHT",
                         help="add world-horizontal rays this high above the floor and take the per-ray minimum "
                              "with the LDS, so furniture bases and shoes below the 17 cm scan plane are seen (0 = off)")
+    parser.add_argument("--dyn-obstacles", type=int, default=0, metavar="N",
+                        help="grscene: up to N moving cylinders (legs, pets) walking the free space "
+                             "(dynamic_obstacles.py); the environment counts hits on them as COLL_OBST")
+    parser.add_argument("--dyn-min", type=int, help="fewest moving obstacles in an episode (default N; drawn per episode)")
+    parser.add_argument("--dyn-radius", type=float, default=0.12)
+    parser.add_argument("--dyn-height", type=float, default=0.8)
+    parser.add_argument("--dyn-speed", type=float, nargs=2, default=(0.2, 0.5), metavar=("MIN", "MAX"),
+                        help="walking speed range (m/s), drawn per leg")
+    parser.add_argument("--dyn-yield", type=float, default=0.45,
+                        help="a moving obstacle waits instead of coming closer than this to the robot (m, centre to centre)")
+    parser.add_argument("--dyn-yield-prob", type=float, default=1.0,
+                        help="chance that a moving obstacle yields at all (drawn per obstacle and episode)")
+    parser.add_argument("--dyn-avoid", type=float, default=0.0,
+                        help="moving obstacles steer like pedestrians to keep this centre distance from the robot (m, 0 = off)")
+    parser.add_argument("--dyn-clearance", type=float, default=1.0,
+                        help="moving obstacles start at least this far from the robot (m)")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--physics-hz", type=float, default=PHYSICS_HZ)
     parser.add_argument("--sensor-hz", type=float, default=SENSOR_HZ)
@@ -98,6 +120,9 @@ def main():
     parser.add_argument("--record", type=Path, help="write top-down JPEG frames with lidar rays to this directory")
     parser.add_argument("--record-hz", type=float, default=10.0, help="frames per second of sim time")
     parser.add_argument("--record-size", type=int, default=720)
+    parser.add_argument("--record-episodes", type=lambda v: {int(e) for e in v.split(",")}, metavar="N,N,...",
+                        help="record only these episodes, each to DIR/epNNN with the camera on its start and goal")
+    parser.add_argument("--record-label", default="", help="text appended to every frame's status line")
     parser.add_argument("--livestream", action="store_true", help="stream the app over WebRTC")
     parser.add_argument("--public-ip", default="", help="address the client uses to reach this host")
     parser.add_argument("--view-hz", type=float, default=20.0, help="livestream frames per wall second")
@@ -109,8 +134,12 @@ def main():
                         help="stream only the viewport, without the Isaac Sim UI around it")
     args = parser.parse_args()
     sys.path.insert(0, str(args.repo / "src" / "turtlebot3_drl"))
+    if args.dyn_obstacles and not args.grscene:
+        raise SystemExit("--dyn-obstacles needs --grscene (the stages have their own moving obstacles)")
 
-    from turtlebot3_drl.common.settings import ENABLE_DYNAMIC_GOALS, ENABLE_TRUE_RANDOM_GOALS
+    from turtlebot3_drl.common.settings import ENABLE_DYNAMIC_GOALS, ENABLE_TRUE_RANDOM_GOALS, MAX_NUMBER_OBSTACLES
+    if args.dyn_obstacles > MAX_NUMBER_OBSTACLES:
+        raise SystemExit(f"--dyn-obstacles: the environment tracks at most {MAX_NUMBER_OBSTACLES} obstacles")
     if ENABLE_TRUE_RANDOM_GOALS or ENABLE_DYNAMIC_GOALS:
         raise SystemExit("The Isaac task controller only implements the stage goal lists; "
                          "ENABLE_TRUE_RANDOM_GOALS and ENABLE_DYNAMIC_GOALS are not supported yet")
@@ -118,7 +147,14 @@ def main():
     if args.grscene:
         # MDL modules are referenced as ::Materials::<name> relative to the scene folder.
         scene_root = args.grscene.resolve()
-        mdl_paths = [str(scene_root), str(scene_root.parents[1])] + [v for v in [os.environ.get("MDL_SYSTEM_PATH")] if v]
+        # Only the shared Materials library goes on the MDL search path. The scene folder links to every
+        # downloaded model and each model folder links back to Materials, so Kit's scan of those trees
+        # grows with every scene fetched (31 GB and an OOM kill with six scenes on disk).
+        mdl_dir = scene_root.parents[2] / "mdl_search"
+        mdl_dir.mkdir(exist_ok=True)
+        if not (mdl_dir / "Materials").exists():
+            (mdl_dir / "Materials").symlink_to(scene_root.parents[1] / "Materials")
+        mdl_paths = [str(mdl_dir)] + [v for v in [os.environ.get("MDL_SYSTEM_PATH")] if v]
         os.environ["MDL_SYSTEM_PATH"] = os.pathsep.join(mdl_paths)
     # The renderer also takes MDL search paths as a setting; both forms are tried.
     extra = {"extra_args": ["--/renderer/mdl/searchPaths/templates=" + ";".join(mdl_paths)]} if args.grscene else {}
@@ -190,7 +226,12 @@ def main():
         move_obstacles = build_in_isaac(world, stage)
     robot = world.scene.add(SingleArticulation(prim_path="/World/burger/Geometry/base_footprint/base_link",
                                                name="burger"))
-    lidar = TurtleBot3Lidar(BASE_SCAN)
+    if args.lidar_samples == 40:
+        lidar = TurtleBot3Lidar(BASE_SCAN)
+    else:
+        n = args.lidar_samples
+        lidar = TurtleBot3Lidar(BASE_SCAN, samples=n, angle_min=0.0, angle_max=2 * math.pi * (n - 1) / n)
+        print(f"lidar: {n} rays, {360 / n:.2f} deg apart", flush=True)
     # drl_gazebo's goal_box: a 0.3 m radius visual without collision.
     goal_marker = world.scene.add(VisualCylinder(prim_path="/World/goal", name="goal", radius=0.3, height=0.01,
                                                  position=np.array([*INITIAL_GOAL, 0.005]),
@@ -203,6 +244,11 @@ def main():
     waypoint_pole = world.scene.add(VisualCylinder(prim_path="/World/waypoint_pole", name="waypoint_pole", radius=0.025,
                                                    height=0.8, position=np.array([0.0, 0.0, -5.0]),
                                                    color=np.array([1.0, 0.8, 0.0])))
+    crowd = None
+    if args.dyn_obstacles:
+        from dynamic_obstacles import IsaacCrowd
+        crowd = IsaacCrowd(world, args.dyn_obstacles, args.dyn_radius, args.dyn_height,
+                           (float(grscene.lo[0]) - 10.0, float(grscene.lo[1]) - 10.0))
     world.reset()
     start_pos, start_quat = robot.get_world_pose()
     sampler = None
@@ -220,7 +266,17 @@ def main():
         start_pos = np.array([0.0, 0.0, float(start_pos[2]) + floor])
         if args.low_rays > 0:
             lidar.low = LowRayLayer(robot, floor, height=args.low_rays, scan_offset=SCAN_OFFSET)
+            lidar.low_every = args.low_rays_every
             print(f"low ray layer at {args.low_rays:.2f} m above the floor", flush=True)
+        if crowd is not None:
+            from dynamic_obstacles import Crowd
+            crowd.attach(Crowd(sampler.occ, args.dyn_obstacles, args.dyn_min, radius=args.dyn_radius,
+                               speed=tuple(args.dyn_speed), yield_dist=args.dyn_yield, yield_prob=args.dyn_yield_prob, avoid=args.dyn_avoid,
+                               start_clearance=args.dyn_clearance, seed=args.seed), floor)
+            print(f"moving obstacles: {args.dyn_min if args.dyn_min is not None else args.dyn_obstacles}-"
+                  f"{args.dyn_obstacles} per episode, radius {args.dyn_radius} m, "
+                  f"{args.dyn_speed[0]}-{args.dyn_speed[1]} m/s, yield within {args.dyn_yield} m "
+                  f"(chance {args.dyn_yield_prob}), steer to keep {args.dyn_avoid} m", flush=True)
 
         def yaw_quat(yaw):
             return np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)])
@@ -364,6 +420,9 @@ def main():
             # does not advance sim time or publish anything.
             move_obstacles(0.0)
             world.step(render=False)
+        if crowd is not None:
+            crowd.park()                 # out of the way of the new start, for the same reason
+            world.step(render=False)
         if sampler is not None and args.start_mode == "random":
             pos, quat = sample_valid_start()
             start_pos[:], start_quat[:] = pos, quat
@@ -377,11 +436,16 @@ def main():
         drive.stop()
         state["episode"] += 1
         state["last"] = "task_fail"
+        if crowd is not None:
+            crowd.reset(state["episode"], (float(start_pos[0]), float(start_pos[1])))
         publish_new_goal()
         return response
 
     def task_succeed(request, response):
         if sampler is not None and args.reset_every_episode:
+            if crowd is not None:
+                crowd.park()
+                world.step(render=False)
             if args.start_mode == "random":
                 pos, quat = sample_valid_start()
                 start_pos[:], start_quat[:] = pos, quat
@@ -390,6 +454,8 @@ def main():
             drive.stop()
         state["episode"] += 1
         state["last"] = "task_succeed"
+        if crowd is not None and args.reset_every_episode:
+            crowd.reset(state["episode"], (float(start_pos[0]), float(start_pos[1])))
         publish_new_goal()
         return response
 
@@ -458,11 +524,27 @@ def main():
             msg.twist.twist.angular.z = (yaw - pyaw) / period
             obstacle_pub.publish(msg)
 
+    def publish_crowd():
+        for frame_id, x, y, vx, vy in crowd.odometry():
+            msg = Odometry()
+            stamp(msg)
+            msg.header.frame_id, msg.child_frame_id = "world", frame_id
+            msg.pose.pose.position.x, msg.pose.pose.position.y = x, y
+            msg.pose.pose.position.z = crowd.floor + crowd.height / 2
+            msg.pose.pose.orientation.w = 1.0
+            msg.twist.twist.linear.x, msg.twist.twist.linear.y = vx, vy
+            obstacle_pub.publish(msg)
+
     sensor_every = max(1, int(round(args.physics_hz / args.sensor_hz)))
     clock_every = max(1, int(round(args.physics_hz / args.clock_hz)))
     record_every = max(1, int(round(args.physics_hz / args.record_hz)))
 
     def record_frame():
+        if args.record_episodes and state.get("recorded_episode") != state["episode"]:
+            state["recorded_episode"] = state["episode"]
+            (sx, sy), (gx, gy) = start_pos[:2], state["goal"]
+            recorder.set_view(args.record / f"ep{state['episode']:03d}", ((sx + gx) / 2, (sy + gy) / 2),
+                              max(2.0, max(abs(gx - sx), abs(gy - sy)) / 2 + 1.2))
         pos, quat = robot.get_world_pose()
         w, x, y, z = (float(q) for q in quat)
         yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
@@ -470,7 +552,7 @@ def main():
         ranges = state["scan"] if state["scan"] is not None else []
         angles = [lidar.angle_min + i * lidar.angle_increment for i in range(len(ranges))]
         text = (f"stage {stage_number}   t {state['sim_time']:7.1f} s   episode {state['episode']}   "
-                f"goal ({state['goal'][0]:+.1f}, {state['goal'][1]:+.1f})   {state['last']}")
+                f"goal ({state['goal'][0]:+.1f}, {state['goal'][1]:+.1f})   {state['last']}   {args.record_label}")
         recorder.capture(text, origin, yaw, [float(r) for r in ranges], angles)
 
     def live_frame():
@@ -494,7 +576,8 @@ def main():
     dt = 1.0 / args.physics_hz
     scene = f"stage{stage.number} ({len(stage.boxes)} walls, {len(stage.obstacles)} obstacles)" if stage else args.scene
     if grscene is not None:
-        scene = f"grscene {args.grscene.name} ({sampler.area:.0f} m2 free, start {args.start_mode})"
+        scene = f"grscene {args.grscene.name} ({sampler.area:.0f} m2 free, start {args.start_mode}" + \
+            (f", up to {args.dyn_obstacles} moving obstacles)" if crowd is not None else ")")
     print(f"isaac_turtlebot3 ready: scene={scene}, physics {args.physics_hz:.0f} Hz, "
           f"sensors {args.physics_hz / sensor_every:.0f} Hz, clock {args.physics_hz / clock_every:.0f} Hz, "
           f"rtf cap {args.rtf or 'none'}, {'running' if state['playing'] else 'paused'}", flush=True)
@@ -521,6 +604,11 @@ def main():
             robot.apply_action(ArticulationAction(joint_velocities=targets))
             if move_obstacles is not None:
                 move_obstacles((state["steps"] + 1) * dt - state["anim_offset"])   # pose at the end of this step
+            if crowd is not None and crowd.active and state["steps"] % sensor_every == 0:
+                # Moved once per sensor period (a pose write per obstacle every physics step costs speed),
+                # to where it is at the period's end, when the lidar reads.
+                rx, ry, _ = robot_xy_yaw()
+                crowd.advance(sensor_every * dt, (rx, ry))
             world.step(render=False)
             state["steps"] += 1
             state["sim_time"] = state["steps"] * dt
@@ -531,7 +619,10 @@ def main():
                 publish_scan()
                 if stage is not None:
                     publish_obstacles()
-            if recorder is not None and state["steps"] % record_every == 0:
+                if crowd is not None and crowd.active:
+                    publish_crowd()
+            if recorder is not None and state["steps"] % record_every == 0 and \
+                    (not args.record_episodes or state["episode"] in args.record_episodes):
                 record_frame()
             if args.rtf > 0:
                 # Serve ROS while throttling, so a pause requested after this

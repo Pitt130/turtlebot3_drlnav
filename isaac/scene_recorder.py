@@ -24,7 +24,8 @@ class TopDownRecorder:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         camera = UsdGeom.Camera.Define(world.stage, CAMERA_PATH)
-        camera.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], CAMERA_HEIGHT))
+        self.camera, self.translate = camera, camera.AddTranslateOp()
+        self.translate.Set(Gf.Vec3d(center[0], center[1], CAMERA_HEIGHT))
         camera.CreateHorizontalApertureAttr(HORIZONTAL_APERTURE)
         camera.CreateVerticalApertureAttr(HORIZONTAL_APERTURE)
         camera.CreateFocalLengthAttr(HORIZONTAL_APERTURE * CAMERA_HEIGHT / (2 * half_width))
@@ -34,6 +35,16 @@ class TopDownRecorder:
         self.annotator.attach([self.render_product])
         self.pool = ThreadPoolExecutor(max_workers=2)
         self.frames = 0
+
+    def set_view(self, out_dir, center, half_width, updates=10):
+        """Point the camera at another square and write the following frames to out_dir, from 000000."""
+        from pxr import Gf
+
+        self.out_dir, self.center, self.half_width, self.frames = Path(out_dir), center, half_width, 0
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.translate.Set(Gf.Vec3d(center[0], center[1], CAMERA_HEIGHT))
+        self.camera.GetFocalLengthAttr().Set(HORIZONTAL_APERTURE * CAMERA_HEIGHT / (2 * half_width))
+        self.warm_up(updates)
 
     def warm_up(self, updates=30):
         for _ in range(updates):
