@@ -100,6 +100,28 @@ class LidarTests(unittest.TestCase):
         result = policy_scan(ranges, 0.0, math.pi / 180, 40, 3.5)
         np.testing.assert_array_equal(result, np.full(40, 3.5, dtype=np.float32))
 
+    def test_sector_minimum_sees_obstacle_between_directions(self):
+        ranges = np.full(360, 3.5)
+        ranges[14] = 0.3  # between policy directions 1 (9.2 deg) and 2 (18.5 deg)
+        result = policy_scan(ranges, 0.0, math.pi / 180, 40, 3.5, pool="min")
+        self.assertAlmostEqual(float(result[2]), 0.3, places=6)  # 4.45 deg from direction 2, inside its 4.6 deg
+        self.assertEqual(float(result[1]), 3.5)                  # 4.77 deg from direction 1, outside
+        self.assertEqual(int((result < 3.5).sum()), 1)
+
+    def test_sector_minimum_covers_every_ray(self):
+        # Every ray of a dense scan falls in some sector, so no obstacle can hide.
+        for i in range(360):
+            ranges = np.full(360, 3.5)
+            ranges[i] = 0.5
+            result = policy_scan(ranges, 0.0, math.pi / 180, 40, 3.5, pool="min")
+            self.assertAlmostEqual(float(result.min()), 0.5, places=6, msg=f"ray {i}")
+
+    def test_sector_minimum_needs_dense_scan(self):
+        with self.assertRaises(ValueError):
+            policy_scan(np.full(40, 2.0), 0.0, 6.28 / 39, 40, 3.5, pool="min")
+        with self.assertRaises(ValueError):
+            policy_scan(np.full(360, 2.0), 0.0, math.pi / 180, 40, 3.5, pool="max")
+
     def test_shifted_origin_preserves_forward_direction(self):
         ranges = np.full(360, 3.5)
         ranges[180] = 0.2  # angle zero in a scan starting at -pi

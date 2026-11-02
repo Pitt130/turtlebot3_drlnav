@@ -26,7 +26,7 @@ def clean_ranges(ranges, cap, range_min=None, range_max=None):
     return np.clip(cleaned, 0.0, cap)
 
 
-def policy_scan(ranges, angle_min, angle_increment, count, cap, range_min=None, range_max=None):
+def policy_scan(ranges, angle_min, angle_increment, count, cap, range_min=None, range_max=None, pool="nearest"):
     """Return distances in bins starting at +X, counterclockwise.
 
     The policy was trained on Gazebo rays at linspace(0, 6.28, count), one ray
@@ -34,7 +34,14 @@ def policy_scan(ranges, angle_min, angle_increment, count, cap, range_min=None, 
     unchanged; denser full-circle scans contribute the ray nearest to each
     legacy angle. Partial or sparse scans are rejected rather than inventing
     free space. Range values are cleaned by clean_ranges().
+
+    pool="min" instead takes the minimum over each direction's sector (half the
+    legacy spacing either side), so a chair leg between two directions still
+    shows up. Policies trained on point samples were not trained for it, and it
+    needs a scan denser than the policy bins.
     """
+    if pool not in ("nearest", "min"):
+        raise ValueError(f"Unknown scan pooling {pool!r}")
     values = np.asarray(ranges, dtype=np.float64)
     if values.ndim != 1 or values.size < 2 or count < 2:
         raise ValueError("A full-circle scan and at least two policy bins are required")
@@ -52,10 +59,17 @@ def policy_scan(ranges, angle_min, angle_increment, count, cap, range_min=None, 
     legacy_angles = np.linspace(0.0, 6.28, count)
     # Preserve the old SDF sampling, including its near-duplicate endpoint.
     if values.size == count and np.allclose(angles, legacy_angles, atol=0.005, rtol=0):
+        if pool == "min":
+            raise ValueError("Sector minima need a scan denser than the policy bins (runtime --lidar-samples)")
         return values.astype(np.float32)
     # Taking the minimum over each angular sector would widen obstacles and
     # change the pretrained policy's actions, so sample like Gazebo instead.
     if step > 2 * math.pi / (count - 1):
         raise ValueError("Scan resolution cannot populate all policy directions")
-    offsets = np.mod(legacy_angles[:, None] - angles[None, :] + math.pi, 2 * math.pi) - math.pi
-    return values[np.argmin(np.abs(offsets), axis=1)].astype(np.float32)
+    offsets = np.abs(np.mod(legacy_angles[:, None] - angles[None, :] + math.pi, 2 * math.pi) - math.pi)
+    nearest = np.argmin(offsets, axis=1)
+    if pool == "nearest":
+        return values[nearest].astype(np.float32)
+    sector = offsets <= (legacy_angles[1] - legacy_angles[0]) / 2 + 1e-9
+    sector[np.arange(count), nearest] = True
+    return np.where(sector, values[None, :], np.inf).min(axis=1).astype(np.float32)

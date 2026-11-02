@@ -42,6 +42,7 @@ from ..common.settings import (
     LIDAR_DISTANCE_CAP,
     MAX_NUMBER_OBSTACLES,
     OBSTACLE_RADIUS,
+    SCAN_POOL,
     SPEED_ANGULAR_MAX,
     SPEED_LINEAR_MAX,
     SUCCESS,
@@ -242,7 +243,7 @@ class DRLGymnasiumEnvironment(Node, gym.Env):
         # differently shaped scan as the policy's full circle.
         distances = policy_scan(msg.ranges, msg.angle_min, msg.angle_increment,
                                 NUM_SCAN_SAMPLES, LIDAR_DISTANCE_CAP,
-                                msg.range_min, msg.range_max)
+                                msg.range_min, msg.range_max, pool=SCAN_POOL)
         self.scan_ranges = (distances / LIDAR_DISTANCE_CAP).tolist()
         # Collisions use every valid ray: a close obstacle can sit between the
         # policy directions, which only sample the scan.

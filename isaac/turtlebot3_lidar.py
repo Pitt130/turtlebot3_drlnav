@@ -42,6 +42,7 @@ class TurtleBot3Lidar:
         self.noise_stddev = float(noise_stddev)
         self.rng = np.random.default_rng(seed)
         self.low = None
+        self.low_every = 1     # cast the low layer at every k-th angle; the others take the nearest one
 
     def raw(self):
         """Depths as reported by the sensor plus hit positions, for checks."""
@@ -54,7 +55,10 @@ class TurtleBot3Lidar:
         if self.low is not None:
             # A low obstacle closer than range_min is already under the robot front (a shoe the
             # wheels ride onto); report it at range_min so it reads as contact, not as no return.
-            low = self.low.depths(self.angles)
+            k = self.low_every
+            low = self.low.depths(self.angles[::k])
+            if k > 1:
+                low = low[np.rint(np.arange(len(self.angles)) / k).astype(int) % len(low)]
             depths = np.minimum(depths, np.where(np.isfinite(low), np.maximum(low, RANGE_MIN), np.inf))
         hit = np.isfinite(depths) & (depths >= RANGE_MIN) & (depths < RANGE_MAX)
         out = np.full(depths.shape, math.inf)
