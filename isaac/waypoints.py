@@ -134,3 +134,33 @@ class WaypointPlanner:
         obs[n] = min(max(d / max_goal_distance, 0.0), 1.0)
         obs[n + 1] = a / math.pi
         return obs
+
+
+class ScanStack:
+    """Older scans in front of the observation, so a reactive policy can tell moving obstacles from still ones.
+
+    With frames=3, skip=2 the policy sees [scan(t-4), scan(t-2), observation(t)], 0.2 s apart at 0.1 s
+    steps. The current observation stays last, so obs[-3] is still the waypoint bearing and a one-frame
+    policy carries over (train.py --init-from gives the older scans zero weights). An episode's first
+    observation fills the history."""
+
+    def __init__(self, frames=1, skip=2, scan_size=40):
+        self.frames, self.skip, self.scan_size = frames, skip, scan_size
+        self.history = []
+
+    def extra(self):
+        return (self.frames - 1) * self.scan_size
+
+    def reset(self, obs):
+        self.history = [np.asarray(obs[:self.scan_size], dtype=np.float32)] * ((self.frames - 1) * self.skip + 1)
+        return self.observation(obs)
+
+    def push(self, obs):
+        self.history = self.history[1:] + [np.asarray(obs[:self.scan_size], dtype=np.float32)]
+        return self.observation(obs)
+
+    def observation(self, obs):
+        if self.frames == 1:
+            return obs
+        older = [self.history[k * self.skip] for k in range(self.frames - 1)]
+        return np.concatenate(older + [np.asarray(obs, dtype=np.float32)]).astype(np.float32)

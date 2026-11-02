@@ -34,12 +34,15 @@ def build_vec_env(
     gamma: float,
     vecnormalize_path: Path | None = None,
     step_sim_time: float = 0.1,
+    wrap=None,
 ) -> VecNormalize:
     """Create the single ROS environment used by SB3 train and evaluation."""
     log_dir.mkdir(parents=True, exist_ok=True)
 
     def make_monitored_env():
         env = make_env(step_sim_time=step_sim_time)
+        if wrap is not None:
+            env = wrap(env)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return Monitor(

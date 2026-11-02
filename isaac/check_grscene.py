@@ -10,6 +10,7 @@ range, every step advances 0.1 s, and the robot does not tumble.
 import argparse
 import csv
 import math
+import sys
 
 import numpy as np
 
@@ -33,11 +34,17 @@ def main():
     parser.add_argument("--scene", help="GRScenes scene folder (for --waypoints): its occupancy_v3_*.npz is used")
     parser.add_argument("--plan-inflate", type=float, default=0.18)
     parser.add_argument("--plan-low-inflate", type=float, help="planning margin around obstacles below the lidar plane")
+    parser.add_argument("--plan-map", default="occupancy_v4",
+                        help="occupancy grid file prefix the planner uses (occupancy_v5: body-height grid from "
+                             "isaac/build_body_map.py); the runtime samples starts and goals on v4 either way")
     parser.add_argument("--stall-recovery", action="store_true",
                         help="move the waypoint 1.5 m ahead for 2 s after 3 s without 0.1 m of path progress")
     parser.add_argument("--path-timeout", type=float, metavar="K",
                         help="episode time limit max(EPISODE_TIMEOUT_SECONDS, K * grid path length / max speed) "
                              "instead of the fixed limit (needs --scene)")
+    parser.add_argument("--scan-stack-skip", type=int, default=2,
+                        help="control steps between stacked scans, as trained (train.py --scan-stack-skip); the number "
+                             "of scans per observation comes from the model's observation size")
     args = parser.parse_args()
     env = make_env(step_sim_time=0.1)
     rng = np.random.default_rng(0)
@@ -47,6 +54,14 @@ def main():
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "sb3"))   # tomas_policy
         from stable_baselines3 import TD3
         policy = TD3.load(args.model, device="cuda")
+    stack = None
+    if policy is not None and policy.observation_space.shape[0] != env.observation_space.shape[0]:
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+        from waypoints import ScanStack
+        scan_size = env.observation_space.shape[0] - 4
+        frames = 1 + (policy.observation_space.shape[0] - env.observation_space.shape[0]) // scan_size
+        stack = ScanStack(frames, args.scan_stack_skip, scan_size)
+        print(f"scans per observation: {frames}, {args.scan_stack_skip} steps apart", flush=True)
     planner = None
     if args.waypoints or args.path_timeout:
         import glob, sys
@@ -55,26 +70,35 @@ def main():
         from waypoints import WaypointPlanner
         from turtlebot3_drl.common.settings import EPISODE_TIMEOUT_SECONDS, SPEED_LINEAR_MAX
         from turtlebot3_drl.drl_environment.drl_environment_gymnasium import MAX_GOAL_DISTANCE
-        occ = Occupancy.load(sorted(glob.glob(f"{args.scene}/occupancy_v4_*.npz"))[0])
+        occ = Occupancy.load(sorted(glob.glob(f"{args.scene}/{args.plan_map}_*.npz"))[0])
         planner = WaypointPlanner(occ, inflate=args.plan_inflate, lookahead=args.waypoints or 1.5,
                                   low_inflate=args.plan_low_inflate)
         if args.waypoints:
             print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m"
                   f" (below-lidar obstacles {args.plan_low_inflate or args.plan_inflate} m),"
-                  f" stall recovery {'on' if args.stall_recovery else 'off'}", flush=True)
+                  f" stall recovery {'on' if args.stall_recovery else 'off'}, map {args.plan_map}", flush=True)
             from geometry_msgs.msg import Pose
             waypoint_pub = env.create_publisher(Pose, "waypoint", 10)     # for the runtime's marker
         if args.path_timeout:
             print(f"time limit: max({EPISODE_TIMEOUT_SECONDS} s, {args.path_timeout} x path / {SPEED_LINEAR_MAX} m/s)", flush=True)
     track_file = open(args.track_out, "w") if args.track_out else None
     if track_file:
-        track_file.write("episode,step,x,y,tilt_deg,min_obstacle,goal_distance,lin,ang,outcome\n")
+        track_file.write("episode,step,x,y,tilt_deg,min_obstacle,goal_distance,lin,ang,outcome,dyn_x,dyn_y\n")
     ok = True
 
     def report(label, passed, detail=""):
         nonlocal ok
         ok &= passed
         print(f"[{'PASS' if passed else 'FAIL'}] {label} {detail}", flush=True)
+
+    def nearest_moving_obstacle(env):
+        """x,y of the closest moving obstacle with a fresh pose, or an empty pair."""
+        d = list(getattr(env, "obstacle_distances", []))
+        samples = getattr(env, "_obstacle_samples", {})
+        if not d or not math.isfinite(min(d)) or d.index(min(d)) not in samples:
+            return ","
+        _, x, y = samples[d.index(min(d))]
+        return f"{x:.3f},{y:.3f}"
 
     starts, goals, min_scans, dts, outcomes, lengths, stalls = [], [], [], [], [], [], []
     for ep in range(args.episodes):
@@ -105,6 +129,8 @@ def main():
                                                       MAX_GOAL_DISTANCE)
             else:
                 policy_obs = obs
+            if stack is not None:
+                policy_obs = stack.push(policy_obs) if n else stack.reset(policy_obs)
             action = policy.predict(policy_obs, deterministic=True)[0] if policy is not None else rng.uniform(-1, 1, 2).astype(np.float32)
             obs, r, term, trunc, info = env.step(action)
             dts.append(info["step_sim_dt"]); n += 1
@@ -112,7 +138,7 @@ def main():
             if track_file:
                 track_file.write(f"{ep + 1},{n},{env.robot_x:.3f},{env.robot_y:.3f},{math.degrees(env.robot_tilt):.2f},"
                                  f"{env.obstacle_distance:.3f},{env.goal_distance:.3f},{float(action[0]):.3f},{float(action[1]):.3f},"
-                                 f"{int(info['success']) if (term or trunc) else 0}\n")
+                                 f"{int(info['success']) if (term or trunc) else 0},{nearest_moving_obstacle(env)}\n")
             if env.robot_tilt > max_tilt:
                 max_tilt, tilt_at = env.robot_tilt, (env.robot_x, env.robot_y)
             if term or trunc:

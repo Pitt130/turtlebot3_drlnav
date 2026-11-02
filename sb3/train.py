@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -275,6 +276,32 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument("--waypoints", type=float, metavar="LOOKAHEAD",
+                        help="hierarchical: the policy sees a grid-path waypoint this far ahead instead of the goal "
+                             "(isaac/waypoint_env.py; needs --scene)")
+    parser.add_argument("--scene", type=Path, help="GRScenes scene folder whose occupancy_v4 grid the planner uses")
+    parser.add_argument("--plan-inflate", type=float, default=0.18)
+    parser.add_argument("--plan-low-inflate", type=float, default=0.30)
+    parser.add_argument("--plan-map", default="occupancy_v4",
+                        help="occupancy grid file prefix the planner uses (occupancy_v5: isaac/build_body_map.py)")
+    parser.add_argument("--stall-recovery", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--path-reward", action=argparse.BooleanOptionalAction, default=True,
+                        help="with --waypoints: reward progress along the grid path instead of the env reward")
+    parser.add_argument("--obstacle-penalty-dist", type=float, default=0.15,
+                        help="with --path-reward: per-step penalty applies when the nearest obstacle is closer (m)")
+    parser.add_argument("--obstacle-penalty", type=float, default=10.0,
+                        help="with --path-reward: per-step penalty near obstacles (stage reward A uses 20 within 0.22 m)")
+    parser.add_argument("--slow-dist", type=float, default=0.0,
+                        help="with --path-reward: inside this distance (m) of the nearest obstacle the speed "
+                             "term's target drops linearly to --slow-min-frac of max speed at contact (0: off)")
+    parser.add_argument("--slow-min-frac", type=float, default=0.3)
+    parser.add_argument("--scan-stack", type=int, default=1, metavar="FRAMES",
+                        help="with --waypoints: scans per observation, the older ones in front (waypoints.ScanStack)")
+    parser.add_argument("--scan-stack-skip", type=int, default=2, metavar="STEPS",
+                        help="control steps between stacked scans")
+    parser.add_argument("--init-from", type=Path,
+                        help="start a new run from this model's weights; first layers that see a longer observation "
+                             "(--scan-stack) get zero weights for the extra inputs, so it starts out acting the same")
     parser.add_argument("--resume-model", type=Path)
     parser.add_argument("--resume-vecnormalize", type=Path)
     parser.add_argument("--resume-replay-buffer", type=Path)
@@ -285,6 +312,31 @@ def parse_args() -> argparse.Namespace:
         help="Fresh transitions collected before updates when resuming without a replay buffer",
     )
     return parser.parse_args()
+
+
+def copy_padded_weights(model, path: Path) -> None:
+    """Load another TD3 model's policy weights into `model`. A first layer whose input grew (older scans
+    stacked in front of the observation) keeps the old weights for the trailing inputs and gets zero
+    weights for the new leading ones, so the network computes exactly what the old one did."""
+    old = TD3.load(str(path), device=model.device).policy.state_dict()
+    new = model.policy.state_dict()
+    if old.keys() != new.keys():
+        raise ValueError(f"--init-from {path}: different policy architecture")
+    padded = []
+    for key, weight in new.items():
+        source = old[key]
+        if source.shape == weight.shape:
+            new[key] = source.clone()
+        elif source.dim() == 2 and source.shape[0] == weight.shape[0] and source.shape[1] < weight.shape[1]:
+            grown = torch.zeros_like(weight)
+            grown[:, -source.shape[1]:] = source
+            new[key] = grown
+            padded.append(key)
+        else:
+            raise ValueError(f"--init-from {path}: {key} is {tuple(source.shape)}, need {tuple(weight.shape)}")
+    model.policy.load_state_dict(new)
+    print(f"initialized from {path}" + (f" (zero weights for new inputs: {', '.join(padded)})" if padded else ""),
+          flush=True)
 
 
 def make_action_noise(kind: str, sigma: float, dt: float = 1.0):
@@ -308,6 +360,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--random-action-until must be non-negative")
     if args.max_grad_norm is not None and args.max_grad_norm <= 0:
         raise ValueError("--max-grad-norm must be positive")
+    if args.init_from and args.resume_model:
+        raise ValueError("--init-from starts a new run; it cannot be combined with --resume-model")
+    if args.scan_stack > 1 and not args.waypoints:
+        raise ValueError("--scan-stack needs --waypoints")
     if args.resume_vecnormalize and not args.resume_model:
         raise ValueError("--resume-vecnormalize requires --resume-model")
     if args.resume_replay_buffer and not args.resume_model:
@@ -348,12 +404,34 @@ def main() -> None:
         "resume_replay_buffer": (
             str(args.resume_replay_buffer.resolve()) if args.resume_replay_buffer else None
         ),
+        "scene": str(args.scene.resolve()) if args.scene else None,
+        "init_from": str(args.init_from.resolve()) if args.init_from else None,
+        "scan_pool": os.environ.get("DRLNAV_SCAN_POOL", "nearest"),
         "stable_baselines3": stable_baselines3.__version__,
         "torch": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
     }
     (output_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
+    wrap = None
+    if args.waypoints:
+        if args.scene is None:
+            raise ValueError("--waypoints needs --scene")
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "isaac"))
+        from waypoint_env import WaypointEnv
+
+        def wrap(e):
+            return WaypointEnv(e, args.scene, lookahead=args.waypoints, inflate=args.plan_inflate,
+                               low_inflate=args.plan_low_inflate, stall_recovery=args.stall_recovery,
+                               path_reward=args.path_reward, obstacle_penalty_dist=args.obstacle_penalty_dist,
+                               obstacle_penalty=args.obstacle_penalty, plan_map=args.plan_map,
+                               slow_dist=args.slow_dist, slow_min_frac=args.slow_min_frac,
+                               scan_stack=args.scan_stack, scan_stack_skip=args.scan_stack_skip)
+        print(f"hierarchical training: waypoints {args.waypoints} m ahead on {args.scene.name}, "
+              f"path reward {args.path_reward} (obstacle -{args.obstacle_penalty} within {args.obstacle_penalty_dist} m), "
+              f"slow within {args.slow_dist} m to {args.slow_min_frac}, "
+              f"plan inflate {args.plan_inflate}, map {args.plan_map}, stall recovery {args.stall_recovery}, "
+              f"scans per observation {args.scan_stack} ({args.scan_stack_skip} steps apart)", flush=True)
     env = build_vec_env(
         log_dir,
         args.seed,
@@ -362,6 +440,7 @@ def main() -> None:
         gamma=args.gamma,
         vecnormalize_path=args.resume_vecnormalize,
         step_sim_time=args.step_sim_time,
+        wrap=wrap,
     )
     action_noise = make_action_noise(args.noise, args.noise_sigma, args.noise_dt)
     optimizer_class = (
@@ -420,6 +499,8 @@ def main() -> None:
             seed=args.seed,
         )
         reset_num_timesteps = True
+        if args.init_from:
+            copy_padded_weights(model, args.init_from)
 
     diagnostics = ActionDiagnostics(log_dir / "actions.csv")
     callbacks = [
