@@ -7,6 +7,8 @@
 | lab：`~/turtlebot3_isaac_migration_latest` | Ubuntu 22.04、ROS 2 Humble、Gazebo Classic；跑 Gazebo 侧测试 |
 | 新服务器：`~/turtlebot3_drlnav` | Ubuntu 24.04、ROS 2 Jazzy、Isaac Sim 6.2（pip，`~/isaacsim/.venv`）、RTX 4070 Ti、i7-14700KF；训练用 `.venv`（torch 2.14 + cu130、SB3 2.7.1） |
 
+后续工作（GRScenes 真实户型中的分层导航、移动障碍物和结果）见 [GRSCENES.md](GRSCENES.md)（英文）。
+
 ## 结论
 
 在 stage 4 上，Isaac 可以替代 Gazebo，训练速度约为 Gazebo 的 2.3 倍（见[结果](#结果)）。

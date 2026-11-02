@@ -2,6 +2,8 @@
 ### ⚠️ Project Status: Unmaintained
 This project is not being actively maintained. It can however still serve as a reference point for similar projects.
 
+> **Isaac Sim fork (branch `isaac-migration`):** [MIGRATION.md](MIGRATION.md) covers the Isaac Sim runtime and the Gazebo comparison; [GRSCENES.md](GRSCENES.md) covers hierarchical navigation in real apartments, with moving obstacles and results.
+
 # Mobile Robot DRL Navigation
 
 ### A ROS2 framework for DRL autonomous navigation on mobile robots with LiDAR.
