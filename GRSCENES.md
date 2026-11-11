@@ -192,7 +192,7 @@ taskset -c 0-15 .venv/bin/python -u sb3/train.py --output-dir <run> --total-time
 
 # dyn: fine-tune slow with moving obstacles and stacked scans
 taskset -c 0-15 .venv/bin/python -u sb3/train.py --output-dir <run> --total-timesteps 150000 --seed 0 \
-    --learning-rate 3e-4 --learning-starts 10000 $COMMON --scan-stack 3 --scan-stack-skip 2 \
+    --learning-rate 3e-4 --learning-starts 10000 --random-action-until 0 $COMMON --scan-stack 3 --scan-stack-skip 2 \
     --init-from <slow run>/models/final_model.zip
 ```
 
