@@ -22,7 +22,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from grscene import Occupancy  # noqa: E402
-from waypoints import ScanStack, WaypointPlanner  # noqa: E402
+from waypoints import ScanStack, WaypointPlanner, make_planner  # noqa: E402
 
 SUCCESS, COLLISION_WALL, COLLISION_OBSTACLE, TIMEOUT, TUMBLE = 1, 2, 3, 4, 5
 TERMINAL = {SUCCESS: 2500.0, COLLISION_WALL: -2000.0, COLLISION_OBSTACLE: -2000.0, TIMEOUT: -500.0, TUMBLE: -1000.0}
@@ -32,10 +32,11 @@ class WaypointEnv(gymnasium.Wrapper):
     def __init__(self, env, scene_dir, lookahead=0.75, inflate=0.18, low_inflate=0.30, stall_recovery=True,
                  path_reward=True, speed_linear_max=0.22, speed_angular_max=2.0, max_goal_distance=None,
                  obstacle_penalty_dist=0.15, obstacle_penalty=10.0, progress_gain=50.0, plan_map="occupancy_v4",
+                 plan_cost=0.0, plan_cost_dist=0.25, plan_fallback_map=None,
                  slow_dist=0.0, slow_min_frac=0.3, collision_dist=0.13, scan_stack=1, scan_stack_skip=2):
         super().__init__(env)
-        occ = Occupancy.load(sorted(glob.glob(f"{scene_dir}/{plan_map}_*.npz"))[0])
-        self.planner = WaypointPlanner(occ, inflate=inflate, lookahead=lookahead, low_inflate=low_inflate)
+        self.planner = make_planner(scene_dir, plan_map, plan_fallback_map, inflate=inflate, lookahead=lookahead,
+                                    low_inflate=low_inflate, cost_weight=plan_cost, cost_dist=plan_cost_dist)
         self.stall_recovery, self.path_reward = stall_recovery, path_reward
         self.v_max, self.w_max = speed_linear_max, speed_angular_max
         if max_goal_distance is None:

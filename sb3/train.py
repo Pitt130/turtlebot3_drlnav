@@ -284,6 +284,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-low-inflate", type=float, default=0.30)
     parser.add_argument("--plan-map", default="occupancy_v4",
                         help="occupancy grid file prefix the planner uses (occupancy_v5: isaac/build_body_map.py)")
+    parser.add_argument("--plan-cost", type=float, default=0.0,
+                        help="clearance-aware planner: cells near the inflated margin cost up to (1 + this) times "
+                             "as much (cost-to-go field, octile steps); 0 = plain step-count wavefront")
+    parser.add_argument("--plan-fallback-map", default=None,
+                        help="occupancy grid prefix (e.g. occupancy_v4) planned on where --plan-map has no path")
+    parser.add_argument("--plan-cost-dist", type=float, default=0.25,
+                        help="with --plan-cost: distance beyond the inflated margin over which the extra cost fades")
     parser.add_argument("--stall-recovery", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--path-reward", action=argparse.BooleanOptionalAction, default=True,
                         help="with --waypoints: reward progress along the grid path instead of the env reward")
@@ -425,12 +432,14 @@ def main() -> None:
                                low_inflate=args.plan_low_inflate, stall_recovery=args.stall_recovery,
                                path_reward=args.path_reward, obstacle_penalty_dist=args.obstacle_penalty_dist,
                                obstacle_penalty=args.obstacle_penalty, plan_map=args.plan_map,
+                               plan_cost=args.plan_cost, plan_cost_dist=args.plan_cost_dist,
+                               plan_fallback_map=args.plan_fallback_map,
                                slow_dist=args.slow_dist, slow_min_frac=args.slow_min_frac,
                                scan_stack=args.scan_stack, scan_stack_skip=args.scan_stack_skip)
         print(f"hierarchical training: waypoints {args.waypoints} m ahead on {args.scene.name}, "
               f"path reward {args.path_reward} (obstacle -{args.obstacle_penalty} within {args.obstacle_penalty_dist} m), "
               f"slow within {args.slow_dist} m to {args.slow_min_frac}, "
-              f"plan inflate {args.plan_inflate}, map {args.plan_map}, stall recovery {args.stall_recovery}, "
+              f"plan inflate {args.plan_inflate}, map {args.plan_map} (fallback {args.plan_fallback_map}), plan cost {args.plan_cost}/{args.plan_cost_dist} m, stall recovery {args.stall_recovery}, "
               f"scans per observation {args.scan_stack} ({args.scan_stack_skip} steps apart)", flush=True)
     env = build_vec_env(
         log_dir,

@@ -28,6 +28,9 @@ def main():
     parser.add_argument("--goal-max", type=float, default=5.5)
     parser.add_argument("--model", help="SB3 TD3 zip: drive with this policy (deterministic) instead of random actions")
     parser.add_argument("--track-out", help="CSV of every step: episode, x, y, tilt_deg, outcome")
+    parser.add_argument("--trace-out", help="JSON lines, one per step (step 0 = after reset), for collision "
+                        "analysis: pose, heading, action, waypoint, stall recovery, the ranges in m, "
+                        "moving obstacles as [index, stamp, x, y]")
     parser.add_argument("--waypoints", type=float, metavar="LOOKAHEAD",
                         help="hierarchical: plan on the scene occupancy grid and give the policy a waypoint this "
                              "far along the path instead of the goal (needs --model and --scene)")
@@ -37,6 +40,13 @@ def main():
     parser.add_argument("--plan-map", default="occupancy_v4",
                         help="occupancy grid file prefix the planner uses (occupancy_v5: body-height grid from "
                              "isaac/build_body_map.py); the runtime samples starts and goals on v4 either way")
+    parser.add_argument("--plan-cost", type=float, default=0.0,
+                        help="clearance-aware planner: cells near the inflated margin cost up to (1 + this) times "
+                             "as much (cost-to-go field, octile steps); 0 = plain step-count wavefront")
+    parser.add_argument("--plan-fallback-map", default=None,
+                        help="occupancy grid prefix (e.g. occupancy_v4) planned on where --plan-map has no path")
+    parser.add_argument("--plan-cost-dist", type=float, default=0.25,
+                        help="with --plan-cost: distance beyond the inflated margin over which the extra cost fades")
     parser.add_argument("--stall-recovery", action="store_true",
                         help="move the waypoint 1.5 m ahead for 2 s after 3 s without 0.1 m of path progress")
     parser.add_argument("--path-timeout", type=float, metavar="K",
@@ -70,13 +80,15 @@ def main():
         from waypoints import WaypointPlanner
         from turtlebot3_drl.common.settings import EPISODE_TIMEOUT_SECONDS, SPEED_LINEAR_MAX
         from turtlebot3_drl.drl_environment.drl_environment_gymnasium import MAX_GOAL_DISTANCE
-        occ = Occupancy.load(sorted(glob.glob(f"{args.scene}/{args.plan_map}_*.npz"))[0])
-        planner = WaypointPlanner(occ, inflate=args.plan_inflate, lookahead=args.waypoints or 1.5,
-                                  low_inflate=args.plan_low_inflate)
+        from waypoints import make_planner
+        planner = make_planner(args.scene, args.plan_map, args.plan_fallback_map, inflate=args.plan_inflate,
+                               lookahead=args.waypoints or 1.5, low_inflate=args.plan_low_inflate,
+                               cost_weight=args.plan_cost, cost_dist=args.plan_cost_dist)
         if args.waypoints:
             print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m"
                   f" (below-lidar obstacles {args.plan_low_inflate or args.plan_inflate} m),"
-                  f" stall recovery {'on' if args.stall_recovery else 'off'}, map {args.plan_map}", flush=True)
+                  f" stall recovery {'on' if args.stall_recovery else 'off'}, map {args.plan_map} (fallback {args.plan_fallback_map}), "
+                  f"plan cost {args.plan_cost}/{args.plan_cost_dist} m", flush=True)
             from geometry_msgs.msg import Pose
             waypoint_pub = env.create_publisher(Pose, "waypoint", 10)     # for the runtime's marker
         if args.path_timeout:
@@ -84,6 +96,25 @@ def main():
     track_file = open(args.track_out, "w") if args.track_out else None
     if track_file:
         track_file.write("episode,step,x,y,tilt_deg,min_obstacle,goal_distance,lin,ang,outcome,dyn_x,dyn_y\n")
+    trace_file = open(args.trace_out, "w") if args.trace_out else None
+
+    def trace(ep, n, action=None, waypoint=None, recovering=False, outcome=0):
+        if trace_file is None:
+            return
+        import json
+        from turtlebot3_drl.common.settings import LIDAR_DISTANCE_CAP
+        samples = getattr(env, "_obstacle_samples", {})
+        trace_file.write(json.dumps({
+            "ep": ep + 1, "step": n, "x": round(env.robot_x, 4), "y": round(env.robot_y, 4),
+            "yaw": round(env.robot_heading, 4), "tilt": round(math.degrees(env.robot_tilt), 2),
+            "lin": None if action is None else round(float(action[0]), 3),
+            "ang": None if action is None else round(float(action[1]), 3),
+            "wp": None if waypoint is None else [round(float(waypoint[0]), 3), round(float(waypoint[1]), 3)],
+            "rec": int(bool(recovering)), "out": outcome,
+            "scan": [round(float(r) * LIDAR_DISTANCE_CAP, 3) for r in env.scan_ranges],
+            "peds": [[int(i), round(float(t), 2), round(float(x), 3), round(float(y), 3)]
+                     for i, (t, x, y) in sorted(samples.items())],
+        }) + "\n")
     ok = True
 
     def report(label, passed, detail=""):
@@ -107,6 +138,8 @@ def main():
         goals.append((env.goal_x, env.goal_y))
         min_scans.append(min(env.scan_ranges) * 3.5)
         n, max_tilt, tilt_at, track = 0, 0.0, None, []
+        recovering = False
+        trace(ep, 0)
         unreachable, path_len = 0, math.nan
         if planner is not None:
             planner.set_goal(env.goal_x, env.goal_y)
@@ -118,7 +151,7 @@ def main():
         while True:
             if args.waypoints:
                 if args.stall_recovery:
-                    wx, wy, reachable, _ = planner.step(env.robot_x, env.robot_y)
+                    wx, wy, reachable, recovering = planner.step(env.robot_x, env.robot_y)
                 else:
                     wx, wy, reachable = planner.waypoint(env.robot_x, env.robot_y)
                 unreachable += not reachable
@@ -135,6 +168,8 @@ def main():
             obs, r, term, trunc, info = env.step(action)
             dts.append(info["step_sim_dt"]); n += 1
             track.append((round(env.robot_x, 3), round(env.robot_y, 3), round(math.degrees(env.robot_tilt), 2)))
+            trace(ep, n, action, (wx, wy) if args.waypoints else None, recovering,
+                  int(info["success"]) if (term or trunc) else 0)
             if track_file:
                 track_file.write(f"{ep + 1},{n},{env.robot_x:.3f},{env.robot_y:.3f},{math.degrees(env.robot_tilt):.2f},"
                                  f"{env.obstacle_distance:.3f},{env.goal_distance:.3f},{float(action[0]):.3f},{float(action[1]):.3f},"
@@ -154,6 +189,8 @@ def main():
               + (f"; path_blocked {stalls[-1]}" if stalls[-1] else ""), flush=True)
         if outcomes[-1] == "TUMBLE":
             print("   last 8 steps (x, y, tilt deg):", track[-8:], flush=True)
+    if trace_file:
+        trace_file.close()
     env.close()
 
     report("starts clear of obstacles", all(m > THRESHOLD_COLLISION + 0.08 for m in min_scans),

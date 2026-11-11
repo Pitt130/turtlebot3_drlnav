@@ -7,17 +7,29 @@ wavefront from the goal, so every free cell knows its distance to the goal) and
 hands the policy a waypoint `lookahead` metres down the path instead of the
 goal. The environment still judges success, timeout and collision against the
 real goal; only the two goal entries of the observation change.
+
+With cost_weight > 0 the planner is clearance-aware: the field is a cost-to-go from the goal
+(Dijkstra, i.e. the A* cost model searched from the goal over the whole grid), with octile step
+lengths (diagonal = sqrt 2) and each cell's cost raised by up to `cost_weight` times when it lies
+within `cost_dist` of the inflated margin. Paths then keep to the middle of open space but still
+use narrow passages. cost_weight = 0 keeps the original step-count wavefront.
+
+`fallback` (set after construction) is a second planner, e.g. on the v4 grid, that takes over
+wherever this planner's grid has no path from the robot to the goal: a finer grid can close a
+passage the start/goal sampler (v4) still counts as open.
 """
+import heapq
 import math
 
 import numpy as np
 
-from grscene import FREE
+from grscene import FREE, LOW, _dilate
 
 
 class WaypointPlanner:
     def __init__(self, occupancy, inflate=0.18, lookahead=1.5, final_within=1.2, low_inflate=None,
-                 stall_steps=30, stall_gain=0.10, recover_steps=20, recover_lookahead=1.5):
+                 stall_steps=30, stall_gain=0.10, recover_steps=20, recover_lookahead=1.5,
+                 cost_weight=0.0, cost_dist=0.25):
         """`occupancy` is the raw grid; it is inflated by `inflate` (less than the sampler's
         0.25 m, so paths exist along furniture the policy can still pass) and LOW cells (below the
         lidar plane, invisible to the policy) by `low_inflate`.
@@ -35,6 +47,45 @@ class WaypointPlanner:
         self.goal = None
         self.dist = None
         self.replans = 0
+        self.cost_weight = cost_weight
+        self.fallback = None        # another WaypointPlanner (e.g. on the coarser v4 grid) used where this one has no path
+        self.fallback_steps = 0
+        self.penalty = self._clearance_penalty(occupancy, inflate, low_inflate or inflate, cost_dist) \
+            if cost_weight > 0 else None
+
+    @staticmethod
+    def _clearance_penalty(occupancy, inflate, low_inflate, cost_dist):
+        """Per cell 0..1: 1 at the inflated margin of an obstacle, falling linearly to 0 `cost_dist` beyond it."""
+        cell, grid = occupancy.cell, occupancy.grid
+        pen = np.zeros(grid.shape)
+        for mask, margin in (((grid != FREE) & (grid != LOW), inflate), (grid == LOW, low_inflate)):
+            n_max = int(math.ceil((margin + cost_dist) / cell))
+            dist = np.full(grid.shape, np.inf)
+            for n in range(n_max, 0, -1):          # smallest disc that reaches the cell wins
+                dist[_dilate(mask, n, False)] = n * cell
+            pen = np.maximum(pen, np.clip((margin + cost_dist - dist) / cost_dist, 0.0, 1.0))
+        return pen
+
+    def _cost_field(self, row, col):
+        """Cost-to-go from (row, col) over FREE cells: octile steps weighted by clearance."""
+        rows, cols = self.free.shape
+        field = np.full(self.free.shape, np.inf)
+        field[row, col] = 0.0
+        w = 1.0 + self.cost_weight * self.penalty
+        heap = [(0.0, row, col)]
+        steps = [(dr, dc, math.hypot(dr, dc)) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
+        while heap:
+            d, r, c = heapq.heappop(heap)
+            if d > field[r, c]:
+                continue
+            for dr, dc, length in steps:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < rows and 0 <= cc < cols and self.free[rr, cc]:
+                    nd = d + length * 0.5 * (w[r, c] + w[rr, cc])
+                    if nd < field[rr, cc]:
+                        field[rr, cc] = nd
+                        heapq.heappush(heap, (nd, rr, cc))
+        return field
 
     def nearest_free(self, row, col):
         if 0 <= row < self.free.shape[0] and 0 <= col < self.free.shape[1] and self.free[row, col]:
@@ -48,8 +99,13 @@ class WaypointPlanner:
             return
         self.goal = (gx, gy)
         r, c = self.nearest_free(*self.occ.to_cell(gx, gy))
-        self.dist = self.occ.path_steps(r, c, max_steps=self.free.shape[0] + self.free.shape[1])
+        if self.cost_weight > 0:
+            self.dist = self._cost_field(r, c)
+        else:
+            self.dist = self.occ.path_steps(r, c, max_steps=self.free.shape[0] + self.free.shape[1])
         self.replans += 1
+        if self.fallback is not None:
+            self.fallback.set_goal(gx, gy)
 
     def reset_progress(self):
         self.best, self.since, self.recovering, self.stalls = math.inf, 0, 0, 0
@@ -80,6 +136,9 @@ class WaypointPlanner:
             return gx, gy, True
         r, c = self.nearest_free(*self.occ.to_cell(rx, ry))
         if not np.isfinite(self.dist[r, c]):
+            if self.fallback is not None:
+                self.fallback_steps += 1
+                return self.fallback.waypoint(rx, ry, lookahead)
             return gx, gy, False
         travelled, cell = 0.0, self.occ.cell
         lookahead = self.lookahead if lookahead is None else lookahead
@@ -104,7 +163,7 @@ class WaypointPlanner:
         """Length (m) of the grid path from (rx, ry) to the goal, following the distance field."""
         r, c = self.nearest_free(*self.occ.to_cell(rx, ry))
         if not np.isfinite(self.dist[r, c]):
-            return math.inf
+            return self.fallback.path_length(rx, ry) if self.fallback is not None else math.inf
         length = 0.0
         while self.dist[r, c] > 0:
             best, best_d = None, self.dist[r, c]
@@ -134,6 +193,19 @@ class WaypointPlanner:
         obs[n] = min(max(d / max_goal_distance, 0.0), 1.0)
         obs[n + 1] = a / math.pi
         return obs
+
+
+def make_planner(scene_dir, plan_map="occupancy_v4", fallback_map=None, **kwargs):
+    """WaypointPlanner on `scene_dir`/`plan_map`_*.npz, with a same-settings fallback planner on `fallback_map`."""
+    import glob
+    from grscene import Occupancy
+
+    def load(prefix):
+        return Occupancy.load(sorted(glob.glob(f"{scene_dir}/{prefix}_*.npz"))[0])
+    planner = WaypointPlanner(load(plan_map), **kwargs)
+    if fallback_map and fallback_map != plan_map:
+        planner.fallback = WaypointPlanner(load(fallback_map), **kwargs)
+    return planner
 
 
 class ScanStack:
