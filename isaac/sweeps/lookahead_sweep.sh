@@ -12,7 +12,7 @@ COMMON="--model $MODEL --scene $SCENE"
 run() {   # name domain "check args"
   local name=$1 domain=$2 cargs=$3
   OUT=$BASE/$name ROS_DOMAIN_ID=$domain SEED=0 CHECK_TIMEOUT=5400 CHECK_ARGS="$COMMON $cargs" \
-    bash /tmp/claude_grscene_test.sh $EPISODES --low-rays 0.04 --reset-every-episode > $BASE/$name.out 2>&1
+    bash isaac/sweeps/grscene_test.sh $EPISODES --low-rays 0.04 --reset-every-episode > $BASE/$name.out 2>&1
 }
 
 batch() {
