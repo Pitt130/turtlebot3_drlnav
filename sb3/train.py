@@ -352,6 +352,15 @@ def parse_args() -> argparse.Namespace:
                         help="with --path-reward: inside this distance (m) of the nearest obstacle the speed "
                              "term's target drops linearly to --slow-min-frac of max speed at contact (0: off)")
     parser.add_argument("--slow-min-frac", type=float, default=0.3)
+    parser.add_argument("--moving-reward", action="store_true",
+                        help="with --path-reward: speed target and near-obstacle penalty ignore moving obstacles, "
+                             "which cost a time-to-collision penalty instead (waypoint_env.WaypointEnv)")
+    parser.add_argument("--ttc-horizon", type=float, default=2.0, help="with --moving-reward: penalty below this TTC (s)")
+    parser.add_argument("--ttc-penalty", type=float, default=10.0, help="with --moving-reward: per-step penalty at TTC 0")
+    parser.add_argument("--ttc-radius", type=float, default=0.30,
+                        help="with --moving-reward: robot-obstacle centre distance counted as a collision (m)")
+    parser.add_argument("--shield-penalty", type=float, default=0.0,
+                        help="with --path-reward: per-step penalty when the safety shield replaces the action")
     parser.add_argument("--scan-stack", type=int, default=1, metavar="FRAMES",
                         help="with --waypoints: scans per observation, the older ones in front (waypoints.ScanStack)")
     parser.add_argument("--scan-stack-skip", type=int, default=2, metavar="STEPS",
@@ -492,9 +501,14 @@ def main() -> None:
                                reverse_guard=args.reverse_guard, plan_dyn_timed=args.plan_dyn_timed,
                                obstacle_features=args.obstacle_features, plan_algorithm=args.plan_algorithm,
                                shield=args.shield, shield_horizon=args.shield_horizon, shield_dist=args.shield_dist,
-                               visible_only=args.visible_only)
+                               visible_only=args.visible_only, moving_reward=args.moving_reward,
+                               ttc_horizon=args.ttc_horizon, ttc_penalty=args.ttc_penalty,
+                               ttc_radius=args.ttc_radius, shield_penalty=args.shield_penalty)
         print(f"planner algorithm {args.plan_algorithm}, safety shield {args.shield} ({args.shield_horizon} s, "
               f"{args.shield_dist} m), visible obstacles only {args.visible_only}", flush=True)
+        print(f"moving-obstacle reward {args.moving_reward} (TTC under {args.ttc_horizon} s costs up to "
+              f"{args.ttc_penalty} per step, radius {args.ttc_radius} m), shield penalty {args.shield_penalty}",
+              flush=True)
         from turtlebot3_drl.common.settings import ENABLE_BACKWARD
         print(f"moving obstacles in the planner {args.plan_dyn_horizon} s ahead (radius {args.plan_dyn_radius} m, "
               f"cost {args.plan_dyn_cost}, every {args.plan_dyn_replan} steps, timed {args.plan_dyn_timed}), "

@@ -13,6 +13,12 @@ v_max at the collision distance, and going faster than that target is penalized 
 older scans go in front of the observation (waypoints.ScanStack), so moving obstacles can be told apart.
 With backward driving (DRLNAV_BACKWARD=1) the speed term sees the signed speed, so reversing costs more
 than stopping and the policy reverses only when that pays off.
+With moving_reward the speed target and the near-obstacle penalty only see walls and furniture (scan rays that
+end on a moving obstacle are left out), so the policy is not taught to slow down or stop as a moving obstacle
+comes close, which non-yielding obstacles punish. Instead every step costs ttc_penalty * (1 - TTC / ttc_horizon)
+while the time to collision with a tracked obstacle (both keep their velocity; collision at ttc_radius between
+robot and obstacle centre) is under ttc_horizon, so getting out of the way pays. shield_penalty is charged
+whenever the safety shield replaces the policy's action.
 """
 import glob
 import math
@@ -39,7 +45,8 @@ class WaypointEnv(gymnasium.Wrapper):
                  plan_los=False, plan_open_passages=None, plan_dyn_horizon=0.0, plan_dyn_radius=0.40,
                  plan_dyn_cost=30.0, plan_dyn_replan=3, reverse_guard=0.0, plan_dyn_timed=False,
                  obstacle_features=0, plan_algorithm="field", shield=False, shield_horizon=1.5, shield_dist=0.32,
-                 visible_only=False):
+                 visible_only=False, moving_reward=False, ttc_horizon=2.0, ttc_penalty=10.0, ttc_radius=0.30,
+                 shield_penalty=0.0):
         super().__init__(env)
         self.planner = make_planner(scene_dir, plan_map, plan_fallback_map, inflate=inflate, lookahead=lookahead,
                                     low_inflate=low_inflate, cost_weight=plan_cost, cost_dist=plan_cost_dist,
@@ -47,7 +54,8 @@ class WaypointEnv(gymnasium.Wrapper):
                                     dyn_radius=plan_dyn_radius, dyn_cost=plan_dyn_cost, dyn_replan=plan_dyn_replan,
                                     dyn_timed=plan_dyn_timed, algorithm=plan_algorithm)
         from waypoints import ObstacleTracker
-        self.tracker = ObstacleTracker() if plan_dyn_horizon > 0 or obstacle_features > 0 or shield else None
+        self.tracker = ObstacleTracker() if plan_dyn_horizon > 0 or obstacle_features > 0 or shield or moving_reward \
+            else None
         self.visible_only = visible_only
         self.shield = None
         if shield:                               # the evaluation's action filter, active while training too
@@ -67,6 +75,8 @@ class WaypointEnv(gymnasium.Wrapper):
         self.obstacle_penalty_dist, self.progress_gain = obstacle_penalty_dist, progress_gain
         self.obstacle_penalty = obstacle_penalty
         self.slow_dist, self.slow_min_frac, self.collision_dist = slow_dist, slow_min_frac, collision_dist
+        self.moving_reward, self.ttc_horizon, self.ttc_penalty = moving_reward, ttc_horizon, ttc_penalty
+        self.ttc_radius, self.shield_penalty = ttc_radius, shield_penalty
         self.prev_len = None
         low, high = self.env.observation_space.low, self.env.observation_space.high
         self.stack = ScanStack(scan_stack, scan_stack_skip, scan_size=len(low) - 4)
@@ -88,6 +98,43 @@ class WaypointEnv(gymnasium.Wrapper):
         e = self._robot()
         f = obstacle_features(e.robot_x, e.robot_y, e.robot_heading, self._obstacles, self.n_obstacle_features)
         return np.concatenate([f, stacked]).astype(np.float32)
+
+    def _static_distance(self, e, mask=0.22, near=1.0, max_age=0.3, scan_offset=-0.032):
+        """Nearest-obstacle distance (m) without the scan rays that end within `mask` m of a moving obstacle's
+        centre, i.e. walls and furniture only. With no moving obstacle within `near` m it is the environment's own
+        distance over every ray."""
+        from turtlebot3_drl.common.settings import LIDAR_DISTANCE_CAP
+        c, s = math.cos(e.robot_heading), math.sin(e.robot_heading)
+        local = []
+        for t, x, y in getattr(e, "_obstacle_samples", {}).values():
+            dx, dy = x - e.robot_x, y - e.robot_y
+            if e.time_sec - t <= max_age and math.hypot(dx, dy) < near + mask:
+                local.append((c * dx + s * dy, -s * dx + c * dy))
+        if not local:
+            return float(e.obstacle_distance)
+        r = np.asarray(e.scan_ranges, dtype=np.float64) * LIDAR_DISTANCE_CAP
+        a = np.arange(len(r)) * 2 * math.pi / len(r)
+        px, py = scan_offset + r * np.cos(a), r * np.sin(a)
+        keep = np.ones(len(r), dtype=bool)
+        for ox, oy in local:
+            keep &= np.hypot(px - ox, py - oy) > mask
+        return float(np.min(r[keep])) if keep.any() else float(LIDAR_DISTANCE_CAP)
+
+    def _min_ttc(self, e, v):
+        """Time (s) until the robot, driving straight on at `v`, is within ttc_radius of a tracked moving
+        obstacle keeping its velocity; 0 when already that close, inf when no obstacle is on a collision course."""
+        hx, hy = math.cos(e.robot_heading), math.sin(e.robot_heading)
+        best = math.inf
+        for x, y, vx, vy in self._obstacles:
+            px, py, ux, uy = x - e.robot_x, y - e.robot_y, vx - v * hx, vy - v * hy
+            c = px * px + py * py - self.ttc_radius ** 2
+            if c <= 0:
+                return 0.0
+            a, b = ux * ux + uy * uy, 2 * (px * ux + py * uy)
+            disc = b * b - 4 * a * c
+            if a > 1e-9 and b < 0 and disc >= 0:
+                best = min(best, (-b - math.sqrt(disc)) / (2 * a))
+        return best
 
     def _robot(self):
         e = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
@@ -127,11 +174,14 @@ class WaypointEnv(gymnasium.Wrapper):
             from waypoints import rear_clearance
             if rear_clearance(np.asarray(self._robot().scan_ranges) * LIDAR_DISTANCE_CAP) < self.reverse_guard:
                 action = np.array([0.0, float(action[1])], dtype=np.float32)   # stop rather than back into something
+        intervened = False
         if self.shield is not None:
             from turtlebot3_drl.common.settings import LIDAR_DISTANCE_CAP
             e = self._robot()
+            before = self.shield.interventions
             action = self.shield.filter(np.asarray(action, dtype=np.float32), e.robot_x, e.robot_y, e.robot_heading,
                                         self._obstacles, np.asarray(e.scan_ranges) * LIDAR_DISTANCE_CAP)
+            intervened = self.shield.interventions > before
         obs, reward, terminated, truncated, info = self.env.step(action)
         e = self._robot()
         obs = self._waypoint_obs(obs)
@@ -146,12 +196,21 @@ class WaypointEnv(gymnasium.Wrapper):
             v = a[0] * self.v_max if self.backward else (a[0] + 1) / 2 * self.v_max
             w = a[1] * self.w_max
             angle = float(obs[-3]) * math.pi                    # waypoint bearing, as the policy sees it
+            near = self._static_distance(e) if self.moving_reward else e.obstacle_distance
             v_target = self.v_max
-            if self.slow_dist > self.collision_dist and e.obstacle_distance < self.slow_dist:
-                frac = (e.obstacle_distance - self.collision_dist) / (self.slow_dist - self.collision_dist)
+            if self.slow_dist > self.collision_dist and near < self.slow_dist:
+                frac = (near - self.collision_dist) / (self.slow_dist - self.collision_dist)
                 v_target = self.v_max * float(np.clip(frac, self.slow_min_frac, 1.0))
             reward = (-abs(angle) - w * w - ((v_target - v) * 10) ** 2 + self.progress_gain * progress - 1.0
-                      + (-self.obstacle_penalty if e.obstacle_distance < self.obstacle_penalty_dist else 0.0))
+                      + (-self.obstacle_penalty if near < self.obstacle_penalty_dist else 0.0))
+            if self.moving_reward:
+                ttc = self._min_ttc(e, v)
+                if ttc < self.ttc_horizon:
+                    reward -= self.ttc_penalty * (1.0 - ttc / self.ttc_horizon)
+                info["ttc"] = ttc
+            if intervened:
+                reward -= self.shield_penalty
+            info["shield"] = intervened
             if terminated or truncated:
                 reward += TERMINAL.get(int(info.get("success", 0)), 0.0)
         return self._with_features(self.stack.push(obs)), float(reward), terminated, truncated, info
