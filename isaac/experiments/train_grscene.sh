@@ -19,6 +19,10 @@
 #   empty disables the stream)
 #   CONVERGED_CMD  run with the run dir after every chunk; exit status 0 ends training early (converged), e.g.
 #                  "python3 isaac/experiments/converged.py" (training success, last 150k steps vs the 150k before)
+#   RESUME=1       continue a stopped run after its last finished chunk (pass the same arguments as before)
+#
+# touch <run>/STOP stops the driver cleanly before its next chunk, after the running one has finished and saved;
+# RESUME=1 with the same arguments then continues from there, e.g. with the livestream switched on (PUBLIC_IP).
 #
 # The two models of GRSCENES.md:
 #   slow: TRAIN_EXTRA="--learning-rate 3e-3 --learning-starts 128 --random-action-until 25000" \
@@ -47,10 +51,18 @@ stop_runtime() {  # chunk dir
 
 run_all() {  # name total chunk seed scenes...
   local NAME=$1 TOTAL=$2 CHUNK=$3 SEED=$4; shift 4; local SCENES=("$@")
-  local RUN=$RESULTS/$NAME prev="" i N=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+  local RUN=$RESULTS/$NAME prev="" i N=$(( (TOTAL + CHUNK - 1) / CHUNK )) first=1
   mkdir -p $RUN/checkpoints
   printf "%s\n" "${SCENES[@]}" > $RUN/scenes.txt
-  for i in $(seq 1 $N); do
+  if [ "${RESUME:-0}" = 1 ]; then                # skip the chunks that finished and saved their model
+    while grep -q "^chunk $first done" $RUN/progress.txt 2>/dev/null && \
+          [ -s $RUN/chunk_$(printf %02d $first)/models/final_model.zip ]; do
+      prev=$RUN/chunk_$(printf %02d $first); first=$(( first + 1 ))
+    done
+    rm -f $RUN/STOP
+    echo "resumed at chunk $first $(date -u)" >> $RUN/progress.txt
+  fi
+  for i in $(seq $first $N); do
     [ -e $RUN/STOP ] && { echo "stopped before chunk $i $(date -u)" >> $RUN/progress.txt; return; }
     local SCENE=${SCENES[$(( (i - 1) % ${#SCENES[@]} ))]}
     local D=$RUN/chunk_$(printf %02d $i) CSEED=$(( SEED * 1000 + i ))
