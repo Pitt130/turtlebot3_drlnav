@@ -23,6 +23,10 @@ so a fine grid needs no fallback. With `los` the waypoint is the farthest point 
 path that the robot sees in a straight line without going deeper into the margin than it already is, and
 within `final_within` the goal replaces the waypoint only when it is seen that way: the robot no longer
 cuts corners through the margin towards a waypoint or goal behind a chair or table leg.
+
+With `dyn_horizon` > 0 and moving obstacles given by set_obstacles() (ObstacleTracker), the waypoints follow
+a field that charges the area each nearby obstacle will sweep in the next `dyn_horizon` s, so the policy is
+led out of an obstacle's way instead of waiting in it (set_obstacles has the details).
 """
 import heapq
 import math
@@ -35,7 +39,8 @@ from grscene import FREE, LOW, _dilate
 class WaypointPlanner:
     def __init__(self, occupancy, inflate=0.18, lookahead=1.5, final_within=1.2, low_inflate=None,
                  stall_steps=30, stall_gain=0.10, recover_steps=20, recover_lookahead=1.5,
-                 cost_weight=0.0, cost_dist=0.25, open_passages=None, los=False):
+                 cost_weight=0.0, cost_dist=0.25, open_passages=None, los=False,
+                 dyn_horizon=0.0, dyn_radius=0.40, dyn_cost=30.0, dyn_replan=3, dyn_range=3.0, dyn_dt=0.25):
         """`occupancy` is the raw grid; it is inflated by `inflate` (less than the sampler's
         0.25 m, so paths exist along furniture the policy can still pass) and LOW cells (below the
         lidar plane, invisible to the policy) by `low_inflate`.
@@ -64,6 +69,49 @@ class WaypointPlanner:
             if cost_weight > 0 else None
         self.los = los
         self.depth = self._margin_depth(occupancy, inflate, low_inflate or inflate) if los else None
+        # moving obstacles (set_obstacles); dyn_horizon = 0 turns the dynamic field off
+        self.dyn_horizon, self.dyn_radius, self.dyn_cost = dyn_horizon, dyn_radius, dyn_cost
+        self.dyn_replan, self.dyn_range, self.dyn_dt = dyn_replan, dyn_range, dyn_dt
+        n = int(math.ceil(dyn_radius / self.occ.cell))
+        disc = np.array([(dr, dc) for dr in range(-n, n + 1) for dc in range(-n, n + 1) if dr * dr + dc * dc <= n * n])
+        self._disc = (disc[:, 0], disc[:, 1])
+        self.obstacles, self.goal_cell, self.dyn_replans = [], None, 0
+        self._reset_dynamic()
+
+    def _reset_dynamic(self):
+        self.dist_dyn, self.dyn_extra, self.dyn_count = None, None, 0
+
+    def set_obstacles(self, obstacles):
+        """Moving obstacles as (x, y, vx, vy) in world coordinates. With dyn_horizon > 0, waypoint() follows a
+        field that also charges `dyn_cost` per cell (fading to half over the horizon) on every cell within
+        `dyn_radius` of where an obstacle within `dyn_range` of the robot will be in the next `dyn_horizon` s
+        at its current velocity, recomputed every `dyn_replan` steps: the robot is led out of its way, and
+        the line-of-sight check keeps waypoints from cutting through that swept area. Progress and stall
+        detection (path_length) keep the static field."""
+        self.obstacles = list(obstacles)
+
+    def _dynamic_cost(self, obstacles):
+        extra = np.zeros(self.free.shape)
+        rows, cols = self.free.shape
+        for x, y, vx, vy in obstacles:
+            for t in np.arange(0.0, self.dyn_horizon + 1e-9, self.dyn_dt):
+                r, c = self.occ.to_cell(x + vx * t, y + vy * t)
+                rr, cc = self._disc[0] + r, self._disc[1] + c
+                ok = (rr >= 0) & (rr < rows) & (cc >= 0) & (cc < cols)
+                cost = self.dyn_cost * (1.0 - 0.5 * t / self.dyn_horizon)
+                extra[rr[ok], cc[ok]] = np.maximum(extra[rr[ok], cc[ok]], cost)
+        return extra
+
+    def _update_dynamic(self, rx, ry):
+        near = [o for o in self.obstacles if math.hypot(o[0] - rx, o[1] - ry) < self.dyn_range]
+        if not near or self.goal_cell is None:
+            self._reset_dynamic()
+            return
+        if self.dist_dyn is None or self.dyn_count % self.dyn_replan == 0:
+            self.dyn_extra = self._dynamic_cost(near)
+            self.dist_dyn = self._cost_field(*self.goal_cell, extra=self.dyn_extra)
+            self.dyn_replans += 1
+        self.dyn_count += 1
 
     def _margin_depth(self, occupancy, inflate, low_inflate):
         """Per cell, how far (m) inside the planning margin it lies: 0 on FREE cells (opened passages
@@ -86,14 +134,17 @@ class WaypointPlanner:
             return float(self.depth[r, c])
         return float(self.depth.max())
 
-    def _los(self, x0, y0, x1, y1, max_depth):
-        """True when the straight line (x0, y0) -> (x1, y1) stays within `max_depth` of the margin's edge."""
+    def _los(self, x0, y0, x1, y1, max_depth, max_extra=None):
+        """True when the straight line (x0, y0) -> (x1, y1) stays within `max_depth` of the margin's edge
+        (and, with a dynamic field, never charges more for moving obstacles than `max_extra`)."""
         n = max(2, int(math.hypot(x1 - x0, y1 - y0) / (self.occ.cell / 2)) + 1)
         t = np.linspace(0.0, 1.0, n)
         rows = np.rint((y0 + t * (y1 - y0) - self.occ.origin[1]) / self.occ.cell).astype(int)
         cols = np.rint((x0 + t * (x1 - x0) - self.occ.origin[0]) / self.occ.cell).astype(int)
         inside = (rows >= 0) & (rows < self.depth.shape[0]) & (cols >= 0) & (cols < self.depth.shape[1])
         if not inside.all():
+            return False
+        if max_extra is not None and (self.dyn_extra[rows, cols] > max_extra + 1e-9).any():
             return False
         return bool((self.depth[rows, cols] <= max_depth + 1e-9).all())
 
@@ -110,12 +161,14 @@ class WaypointPlanner:
             pen = np.maximum(pen, np.clip((margin + cost_dist - dist) / cost_dist, 0.0, 1.0))
         return pen
 
-    def _cost_field(self, row, col):
-        """Cost-to-go from (row, col) over FREE cells: octile steps weighted by clearance."""
+    def _cost_field(self, row, col, extra=None):
+        """Cost-to-go from (row, col) over FREE cells: octile steps weighted by clearance (+ `extra` per cell)."""
         rows, cols = self.free.shape
         field = np.full(self.free.shape, np.inf)
         field[row, col] = 0.0
-        w = 1.0 + self.cost_weight * self.penalty
+        w = 1.0 + (self.cost_weight * self.penalty if self.penalty is not None else 0.0)
+        if extra is not None:
+            w = w + extra
         heap = [(0.0, row, col)]
         steps = [(dr, dc, math.hypot(dr, dc)) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
         while heap:
@@ -143,6 +196,8 @@ class WaypointPlanner:
             return
         self.goal = (gx, gy)
         r, c = self.nearest_free(*self.occ.to_cell(gx, gy))
+        self.goal_cell = (r, c)
+        self._reset_dynamic()
         if self.cost_weight > 0:
             self.dist = self._cost_field(r, c)
         else:
@@ -153,9 +208,13 @@ class WaypointPlanner:
 
     def reset_progress(self):
         self.best, self.since, self.recovering, self.stalls = math.inf, 0, 0, 0
+        if hasattr(self, "dyn_horizon"):
+            self._reset_dynamic()
 
     def step(self, rx, ry):
         """waypoint() with stall recovery; returns (x, y, reachable, recovering)."""
+        if self.dyn_horizon > 0:
+            self._update_dynamic(rx, ry)
         length = self.path_length(rx, ry)
         if length < self.best - self.stall_gain:
             self.best, self.since = length, 0
@@ -179,10 +238,17 @@ class WaypointPlanner:
         """
         gx, gy = self.goal
         depth = self._depth_at(rx, ry) if self.los else None
-        if math.hypot(gx - rx, gy - ry) <= self.final_within and (not self.los or self._los(rx, ry, gx, gy, depth)):
+        field = self.dist_dyn if getattr(self, "dist_dyn", None) is not None else self.dist
+        extra = None                                       # moving obstacles: not deeper into their swept area
+        if field is not self.dist and self.los:
+            r0, c0 = self.occ.to_cell(rx, ry)
+            inside = 0 <= r0 < self.free.shape[0] and 0 <= c0 < self.free.shape[1]
+            extra = float(self.dyn_extra[r0, c0]) if inside else float(self.dyn_extra.max())
+        if math.hypot(gx - rx, gy - ry) <= self.final_within and \
+                (not self.los or self._los(rx, ry, gx, gy, depth, extra)):
             return gx, gy, True
         r, c = self.nearest_free(*self.occ.to_cell(rx, ry))
-        if not np.isfinite(self.dist[r, c]):
+        if not np.isfinite(field[r, c]):
             if self.fallback is not None:
                 self.fallback_steps += 1
                 return self.fallback.waypoint(rx, ry, lookahead)
@@ -191,13 +257,13 @@ class WaypointPlanner:
         lookahead = self.lookahead if lookahead is None else lookahead
         cells = [(r, c)]                                   # the path from the robot's (nearest free) cell
         while travelled < lookahead:
-            best, best_d = None, self.dist[r, c]
+            best, best_d = None, field[r, c]
             for dr in (-1, 0, 1):
                 for dc in (-1, 0, 1):
                     rr, cc = r + dr, c + dc
                     if (dr or dc) and 0 <= rr < self.free.shape[0] and 0 <= cc < self.free.shape[1] \
-                            and self.dist[rr, cc] < best_d:
-                        best, best_d = (rr, cc), self.dist[rr, cc]
+                            and field[rr, cc] < best_d:
+                        best, best_d = (rr, cc), field[rr, cc]
             if best is None:
                 break
             travelled += cell * math.hypot(best[0] - r, best[1] - c)
@@ -208,7 +274,7 @@ class WaypointPlanner:
         if self.los:
             for pr, pc in reversed(cells):
                 x, y = self.occ.to_world(pr, pc)
-                if self._los(rx, ry, x, y, depth):
+                if self._los(rx, ry, x, y, depth, extra):
                     return x, y, True
             r, c = cells[0]                                # nothing seen: back to the nearest free cell first
         x, y = self.occ.to_world(r, c)
@@ -248,6 +314,43 @@ class WaypointPlanner:
         obs[n] = min(max(d / max_goal_distance, 0.0), 1.0)
         obs[n + 1] = a / math.pi
         return obs
+
+
+class ObstacleTracker:
+    """(x, y, vx, vy) of the moving obstacles from the environment's pose samples ({index: (stamp, x, y)}).
+
+    Velocities come from samples at least `min_dt` s apart; samples older than `max_age` s are dropped.
+    In simulation the samples are the obstacles' true poses; a robot would feed tracked lidar clusters."""
+
+    def __init__(self, min_dt=0.2, max_age=0.3):
+        self.min_dt, self.max_age = min_dt, max_age
+        self.reset()
+
+    def reset(self):
+        self.prev, self.vel = {}, {}
+
+    def update(self, samples, now):
+        out = []
+        for i, (t, x, y) in samples.items():
+            if now - t > self.max_age:
+                continue
+            p = self.prev.get(i)
+            if p is None or t < p[0]:
+                self.prev[i] = (t, x, y)
+            elif t - p[0] >= self.min_dt:
+                self.vel[i] = ((x - p[1]) / (t - p[0]), (y - p[2]) / (t - p[0]))
+                self.prev[i] = (t, x, y)
+            vx, vy = self.vel.get(i, (0.0, 0.0))
+            out.append((x, y, vx, vy))
+        return out
+
+
+def rear_clearance(ranges, half_angle=60.0):
+    """Smallest range (m) within `half_angle` degrees of straight behind; ranges go counterclockwise from ahead."""
+    ranges = np.asarray(ranges, dtype=np.float64)
+    angles = np.arange(len(ranges)) * 360.0 / len(ranges)
+    behind = np.abs((angles - 180.0 + 180.0) % 360.0 - 180.0) <= half_angle
+    return float(ranges[behind].min())
 
 
 def make_planner(scene_dir, plan_map="occupancy_v4", fallback_map=None, **kwargs):

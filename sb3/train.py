@@ -294,6 +294,13 @@ def parse_args() -> argparse.Namespace:
                              "margin; the goal only when seen that way (waypoints.WaypointPlanner los)")
     parser.add_argument("--plan-open-passages", type=float, nargs=2, metavar=("RADIUS", "LOW_RADIUS"),
                         help="open passages the margins close where this clearance remains (Occupancy.inflated_open)")
+    parser.add_argument("--plan-dyn-horizon", type=float, default=0.0,
+                        help="seconds of predicted moving-obstacle motion charged in the waypoint field (0 = off)")
+    parser.add_argument("--plan-dyn-radius", type=float, default=0.40)
+    parser.add_argument("--plan-dyn-cost", type=float, default=30.0)
+    parser.add_argument("--plan-dyn-replan", type=int, default=3)
+    parser.add_argument("--reverse-guard", type=float, default=0.0, metavar="M",
+                        help="with backward driving: stop instead of reversing when something is within M m behind")
     parser.add_argument("--plan-cost-dist", type=float, default=0.25,
                         help="with --plan-cost: distance beyond the inflated margin over which the extra cost fades")
     parser.add_argument("--stall-recovery", action=argparse.BooleanOptionalAction, default=True)
@@ -441,8 +448,14 @@ def main() -> None:
                                plan_fallback_map=args.plan_fallback_map,
                                slow_dist=args.slow_dist, slow_min_frac=args.slow_min_frac,
                                scan_stack=args.scan_stack, scan_stack_skip=args.scan_stack_skip,
-                               plan_los=args.plan_los, plan_open_passages=args.plan_open_passages)
+                               plan_los=args.plan_los, plan_open_passages=args.plan_open_passages,
+                               plan_dyn_horizon=args.plan_dyn_horizon, plan_dyn_radius=args.plan_dyn_radius,
+                               plan_dyn_cost=args.plan_dyn_cost, plan_dyn_replan=args.plan_dyn_replan,
+                               reverse_guard=args.reverse_guard)
         from turtlebot3_drl.common.settings import ENABLE_BACKWARD
+        print(f"moving obstacles in the planner {args.plan_dyn_horizon} s ahead (radius {args.plan_dyn_radius} m, "
+              f"cost {args.plan_dyn_cost}, every {args.plan_dyn_replan} steps), reverse guard {args.reverse_guard} m",
+              flush=True)
         print(f"planner line of sight {args.plan_los}, open passages {args.plan_open_passages}, "
               f"backward driving {ENABLE_BACKWARD}, scan pool {os.environ.get('DRLNAV_SCAN_POOL', 'nearest')} "
               f"{os.environ.get('DRLNAV_SCAN_SAMPLES', 'default')} rays", flush=True)

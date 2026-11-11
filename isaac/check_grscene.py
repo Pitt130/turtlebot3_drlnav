@@ -49,6 +49,14 @@ def main():
                         help="waypoint = farthest path point seen in a straight line (waypoints.WaypointPlanner los)")
     parser.add_argument("--plan-open-passages", type=float, nargs=2, metavar=("RADIUS", "LOW_RADIUS"),
                         help="open passages the margins close where this clearance remains (Occupancy.inflated_open)")
+    parser.add_argument("--plan-dyn-horizon", type=float, default=0.0,
+                        help="seconds of predicted moving-obstacle motion charged in the waypoint field (0 = off; "
+                             "waypoints.WaypointPlanner.set_obstacles)")
+    parser.add_argument("--plan-dyn-radius", type=float, default=0.40, help="radius (m) charged around a predicted obstacle")
+    parser.add_argument("--plan-dyn-cost", type=float, default=30.0, help="extra cost per cell in the swept area")
+    parser.add_argument("--plan-dyn-replan", type=int, default=3, help="control steps between dynamic replans")
+    parser.add_argument("--reverse-guard", type=float, default=0.0, metavar="M",
+                        help="with backward driving: stop instead of reversing when something is within M m behind")
     parser.add_argument("--plan-cost-dist", type=float, default=0.25,
                         help="with --plan-cost: distance beyond the inflated margin over which the extra cost fades")
     parser.add_argument("--stall-recovery", action="store_true",
@@ -88,8 +96,12 @@ def main():
         planner = make_planner(args.scene, args.plan_map, args.plan_fallback_map, inflate=args.plan_inflate,
                                lookahead=args.waypoints or 1.5, low_inflate=args.plan_low_inflate,
                                cost_weight=args.plan_cost, cost_dist=args.plan_cost_dist,
-                               open_passages=args.plan_open_passages, los=args.plan_los)
-        print(f"planner line of sight {args.plan_los}, open passages {args.plan_open_passages}", flush=True)
+                               open_passages=args.plan_open_passages, los=args.plan_los,
+                               dyn_horizon=args.plan_dyn_horizon, dyn_radius=args.plan_dyn_radius,
+                               dyn_cost=args.plan_dyn_cost, dyn_replan=args.plan_dyn_replan)
+        print(f"planner line of sight {args.plan_los}, open passages {args.plan_open_passages}, moving obstacles "
+              f"{args.plan_dyn_horizon} s ahead (radius {args.plan_dyn_radius} m, cost {args.plan_dyn_cost}, every "
+              f"{args.plan_dyn_replan} steps), reverse guard {args.reverse_guard} m", flush=True)
         if args.waypoints:
             print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m"
                   f" (below-lidar obstacles {args.plan_low_inflate or args.plan_inflate} m),"
@@ -99,6 +111,11 @@ def main():
             waypoint_pub = env.create_publisher(Pose, "waypoint", 10)     # for the runtime's marker
         if args.path_timeout:
             print(f"time limit: max({EPISODE_TIMEOUT_SECONDS} s, {args.path_timeout} x path / {SPEED_LINEAR_MAX} m/s)", flush=True)
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+    from waypoints import ObstacleTracker, rear_clearance
+    from turtlebot3_drl.common.settings import ENABLE_BACKWARD, LIDAR_DISTANCE_CAP
+    tracker = ObstacleTracker()
+    guarded = 0
     track_file = open(args.track_out, "w") if args.track_out else None
     if track_file:
         track_file.write("episode,step,x,y,tilt_deg,min_obstacle,goal_distance,lin,ang,outcome,dyn_x,dyn_y\n")
@@ -145,6 +162,7 @@ def main():
         min_scans.append(min(env.scan_ranges) * 3.5)
         n, max_tilt, tilt_at, track = 0, 0.0, None, []
         recovering = False
+        tracker.reset()
         trace(ep, 0)
         unreachable, path_len = 0, math.nan
         if planner is not None:
@@ -157,6 +175,8 @@ def main():
         while True:
             if args.waypoints:
                 if args.stall_recovery:
+                    if args.plan_dyn_horizon > 0:
+                        planner.set_obstacles(tracker.update(getattr(env, "_obstacle_samples", {}), env.time_sec))
                     wx, wy, reachable, recovering = planner.step(env.robot_x, env.robot_y)
                 else:
                     wx, wy, reachable = planner.waypoint(env.robot_x, env.robot_y)
@@ -171,6 +191,10 @@ def main():
             if stack is not None:
                 policy_obs = stack.push(policy_obs) if n else stack.reset(policy_obs)
             action = policy.predict(policy_obs, deterministic=True)[0] if policy is not None else rng.uniform(-1, 1, 2).astype(np.float32)
+            if args.reverse_guard > 0 and ENABLE_BACKWARD and action[0] < 0 and \
+                    rear_clearance(np.asarray(env.scan_ranges) * LIDAR_DISTANCE_CAP) < args.reverse_guard:
+                action = np.array([0.0, action[1]], dtype=np.float32)     # stop rather than back into something
+                guarded += 1
             obs, r, term, trunc, info = env.step(action)
             dts.append(info["step_sim_dt"]); n += 1
             track.append((round(env.robot_x, 3), round(env.robot_y, 3), round(math.degrees(env.robot_tilt), 2)))
@@ -195,6 +219,8 @@ def main():
               + (f"; path_blocked {stalls[-1]}" if stalls[-1] else ""), flush=True)
         if outcomes[-1] == "TUMBLE":
             print("   last 8 steps (x, y, tilt deg):", track[-8:], flush=True)
+    if args.reverse_guard > 0:
+        print(f"reverse guard: {guarded} reversing steps turned into stops", flush=True)
     if trace_file:
         trace_file.close()
     env.close()
