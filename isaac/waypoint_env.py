@@ -38,7 +38,8 @@ class WaypointEnv(gymnasium.Wrapper):
                  slow_dist=0.0, slow_min_frac=0.3, collision_dist=0.13, scan_stack=1, scan_stack_skip=2,
                  plan_los=False, plan_open_passages=None, plan_dyn_horizon=0.0, plan_dyn_radius=0.40,
                  plan_dyn_cost=30.0, plan_dyn_replan=3, reverse_guard=0.0, plan_dyn_timed=False,
-                 obstacle_features=0, plan_algorithm="field"):
+                 obstacle_features=0, plan_algorithm="field", shield=False, shield_horizon=1.5, shield_dist=0.32,
+                 visible_only=False):
         super().__init__(env)
         self.planner = make_planner(scene_dir, plan_map, plan_fallback_map, inflate=inflate, lookahead=lookahead,
                                     low_inflate=low_inflate, cost_weight=plan_cost, cost_dist=plan_cost_dist,
@@ -46,7 +47,13 @@ class WaypointEnv(gymnasium.Wrapper):
                                     dyn_radius=plan_dyn_radius, dyn_cost=plan_dyn_cost, dyn_replan=plan_dyn_replan,
                                     dyn_timed=plan_dyn_timed, algorithm=plan_algorithm)
         from waypoints import ObstacleTracker
-        self.tracker = ObstacleTracker() if plan_dyn_horizon > 0 or obstacle_features > 0 else None
+        self.tracker = ObstacleTracker() if plan_dyn_horizon > 0 or obstacle_features > 0 or shield else None
+        self.visible_only = visible_only
+        self.shield = None
+        if shield:                               # the evaluation's action filter, active while training too
+            from turtlebot3_drl.common.settings import ENABLE_BACKWARD as _backward
+            from waypoints import SafetyShield
+            self.shield = SafetyShield(backward=_backward, horizon=shield_horizon, d_obst=shield_dist)
         self.reverse_guard = reverse_guard
         self.n_obstacle_features, self._obstacles = obstacle_features, []
         self.stall_recovery, self.path_reward = stall_recovery, path_reward
@@ -89,7 +96,12 @@ class WaypointEnv(gymnasium.Wrapper):
     def _waypoint_obs(self, obs):
         e = self._robot()
         if self.tracker is not None:
-            self._obstacles = self.tracker.update(getattr(e, "_obstacle_samples", {}), e.time_sec)
+            pose = ranges = None
+            if self.visible_only:                # only what the scan sees, as a lidar tracker would
+                from turtlebot3_drl.common.settings import LIDAR_DISTANCE_CAP
+                pose, ranges = (e.robot_x, e.robot_y, e.robot_heading), np.asarray(e.scan_ranges) * LIDAR_DISTANCE_CAP
+            self._obstacles = self.tracker.update(getattr(e, "_obstacle_samples", {}), e.time_sec, pose=pose,
+                                                  ranges=ranges)
             if self.planner.dyn_horizon > 0:
                 self.planner.set_obstacles(self._obstacles)
         if self.stall_recovery:
@@ -115,6 +127,11 @@ class WaypointEnv(gymnasium.Wrapper):
             from waypoints import rear_clearance
             if rear_clearance(np.asarray(self._robot().scan_ranges) * LIDAR_DISTANCE_CAP) < self.reverse_guard:
                 action = np.array([0.0, float(action[1])], dtype=np.float32)   # stop rather than back into something
+        if self.shield is not None:
+            from turtlebot3_drl.common.settings import LIDAR_DISTANCE_CAP
+            e = self._robot()
+            action = self.shield.filter(np.asarray(action, dtype=np.float32), e.robot_x, e.robot_y, e.robot_heading,
+                                        self._obstacles, np.asarray(e.scan_ranges) * LIDAR_DISTANCE_CAP)
         obs, reward, terminated, truncated, info = self.env.step(action)
         e = self._robot()
         obs = self._waypoint_obs(obs)

@@ -307,6 +307,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-dyn-replan", type=int, default=3)
     parser.add_argument("--reverse-guard", type=float, default=0.0, metavar="M",
                         help="with backward driving: stop instead of reversing when something is within M m behind")
+    parser.add_argument("--shield", action="store_true",
+                        help="filter actions against the tracked moving obstacles while training (waypoints.SafetyShield)")
+    parser.add_argument("--shield-horizon", type=float, default=1.5)
+    parser.add_argument("--shield-dist", type=float, default=0.32)
+    parser.add_argument("--visible-only", action="store_true",
+                        help="track only moving obstacles the scan sees")
     parser.add_argument("--plan-algorithm", choices=["field", "astar"], default="field",
                         help="field: descend the Dijkstra cost-to-go field; astar: A* from the robot (same costs)")
     parser.add_argument("--plan-dyn-timed", action="store_true",
@@ -466,7 +472,11 @@ def main() -> None:
                                plan_dyn_horizon=args.plan_dyn_horizon, plan_dyn_radius=args.plan_dyn_radius,
                                plan_dyn_cost=args.plan_dyn_cost, plan_dyn_replan=args.plan_dyn_replan,
                                reverse_guard=args.reverse_guard, plan_dyn_timed=args.plan_dyn_timed,
-                               obstacle_features=args.obstacle_features, plan_algorithm=args.plan_algorithm)
+                               obstacle_features=args.obstacle_features, plan_algorithm=args.plan_algorithm,
+                               shield=args.shield, shield_horizon=args.shield_horizon, shield_dist=args.shield_dist,
+                               visible_only=args.visible_only)
+        print(f"planner algorithm {args.plan_algorithm}, safety shield {args.shield} ({args.shield_horizon} s, "
+              f"{args.shield_dist} m), visible obstacles only {args.visible_only}", flush=True)
         from turtlebot3_drl.common.settings import ENABLE_BACKWARD
         print(f"moving obstacles in the planner {args.plan_dyn_horizon} s ahead (radius {args.plan_dyn_radius} m, "
               f"cost {args.plan_dyn_cost}, every {args.plan_dyn_replan} steps, timed {args.plan_dyn_timed}), "
