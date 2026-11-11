@@ -41,7 +41,8 @@ class WaypointPlanner:
                  stall_steps=30, stall_gain=0.10, recover_steps=20, recover_lookahead=1.5,
                  cost_weight=0.0, cost_dist=0.25, open_passages=None, los=False,
                  dyn_horizon=0.0, dyn_radius=0.40, dyn_cost=30.0, dyn_replan=3, dyn_range=3.0, dyn_dt=0.25,
-                 dyn_timed=False, dyn_speed=0.2, dyn_window=(1.0, 0.7)):
+                 dyn_timed=False, dyn_speed=0.2, dyn_window=(1.0, 0.7),
+                 algorithm="field", astar_replan=10, astar_offpath=0.25):
         """`occupancy` is the raw grid; it is inflated by `inflate` (less than the sampler's
         0.25 m, so paths exist along furniture the policy can still pass) and LOW cells (below the
         lidar plane, invisible to the policy) by `low_inflate`.
@@ -78,10 +79,85 @@ class WaypointPlanner:
         disc = np.array([(dr, dc) for dr in range(-n, n + 1) for dc in range(-n, n + 1) if dr * dr + dc * dc <= n * n])
         self._disc = (disc[:, 0], disc[:, 1])
         self.obstacles, self.goal_cell, self.dyn_replans = [], None, 0
+        if algorithm not in ("field", "astar"):
+            raise ValueError(f"unknown planner algorithm {algorithm}")
+        self.algorithm, self.astar_replan, self.astar_offpath = algorithm, astar_replan, astar_offpath
+        self.astar_path, self.astar_count, self.astar_searches = None, 0, 0
+        self._steps = [(dr, dc, math.hypot(dr, dc)) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
         self._reset_dynamic()
 
     def _reset_dynamic(self):
+        if getattr(self, "dyn_extra", None) is not None:
+            self.astar_path = None                     # the obstacle costs are gone: search again
         self.dist_dyn, self.dyn_extra, self.dyn_count = None, None, 0
+
+    def _weights(self, extra=None):
+        w = 1.0 + (self.cost_weight * self.penalty if self.penalty is not None else 0.0)
+        return w + extra if extra is not None else w + np.zeros(self.free.shape)
+
+    def _astar(self, start, goal, extra=None):
+        """Cheapest 8-connected path start -> goal over FREE cells under the field's cost model (step length
+        times the mean weight of the two cells, weights >= 1), with the octile distance as heuristic, which is
+        admissible and consistent for weights >= 1, so the path costs exactly what _cost_field says.
+        Returns (cells, cost) or (None, inf)."""
+        rows, cols = self.free.shape
+        w = self._weights(extra)
+        gr, gc = goal
+        root2 = math.sqrt(2.0) - 2.0
+        g = {start: 0.0}
+        parent = {start: None}
+        heap = [(0.0, 0.0, start)]
+        closed = set()
+        while heap:
+            _, d, cur = heapq.heappop(heap)
+            if cur in closed:
+                continue
+            if cur == goal:
+                break
+            closed.add(cur)
+            r, c = cur
+            for dr, dc, length in self._steps:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < rows and 0 <= cc < cols and self.free[rr, cc]:
+                    nd = d + length * 0.5 * (w[r, c] + w[rr, cc])
+                    if nd < g.get((rr, cc), math.inf):
+                        g[(rr, cc)], parent[(rr, cc)] = nd, cur
+                        hr, hc = abs(rr - gr), abs(cc - gc)
+                        heapq.heappush(heap, (nd + hr + hc + root2 * min(hr, hc), nd, (rr, cc)))
+        if goal not in parent:
+            return None, math.inf
+        path, cur = [], goal
+        while cur is not None:
+            path.append(cur)
+            cur = parent[cur]
+        return path[::-1], g[goal]
+
+    def _astar_cells(self, rx, ry, lookahead):
+        """The robot's stretch of the A* path, up to `lookahead` m: the cached path while the robot stays within
+        astar_offpath of it, searched again every astar_replan calls and whenever the obstacle costs change."""
+        start = self.nearest_free(*self.occ.to_cell(rx, ry))
+        cell = self.occ.cell
+        idx = None
+        if self.astar_path is not None:
+            head = np.array(self.astar_path[:80])
+            d = np.hypot(head[:, 0] - start[0], head[:, 1] - start[1]) * cell
+            j = int(np.argmin(d))
+            idx = j if d[j] <= self.astar_offpath else None
+        if self.astar_path is None or idx is None or self.astar_count % self.astar_replan == 0:
+            self.astar_path, _ = self._astar(start, self.goal_cell, self.dyn_extra)
+            self.astar_searches += 1
+            idx = 0
+        self.astar_count += 1
+        if self.astar_path is None:
+            return None
+        path = self.astar_path
+        cells, travelled = [path[idx]], 0.0
+        for a, b in zip(path[idx:], path[idx + 1:]):
+            travelled += cell * math.hypot(b[0] - a[0], b[1] - a[1])
+            cells.append(b)
+            if travelled >= lookahead:
+                break
+        return cells
 
     def set_obstacles(self, obstacles):
         """Moving obstacles as (x, y, vx, vy) in world coordinates. With dyn_horizon > 0, waypoint() follows a
@@ -122,9 +198,12 @@ class WaypointPlanner:
         if not near or self.goal_cell is None:
             self._reset_dynamic()
             return
-        if self.dist_dyn is None or self.dyn_count % self.dyn_replan == 0:
+        if self.dyn_extra is None or self.dyn_count % self.dyn_replan == 0:
             self.dyn_extra = self._dynamic_cost(near, rx, ry)
-            self.dist_dyn = self._cost_field(*self.goal_cell, extra=self.dyn_extra)
+            if self.algorithm == "astar":
+                self.astar_path = None                 # search again with the new obstacle costs
+            else:
+                self.dist_dyn = self._cost_field(*self.goal_cell, extra=self.dyn_extra)
             self.dyn_replans += 1
         self.dyn_count += 1
 
@@ -213,6 +292,7 @@ class WaypointPlanner:
         r, c = self.nearest_free(*self.occ.to_cell(gx, gy))
         self.goal_cell = (r, c)
         self._reset_dynamic()
+        self.astar_path, self.astar_count = None, 0
         if self.cost_weight > 0:
             self.dist = self._cost_field(r, c)
         else:
@@ -253,39 +333,45 @@ class WaypointPlanner:
         """
         gx, gy = self.goal
         depth = self._depth_at(rx, ry) if self.los else None
-        field = self.dist_dyn if getattr(self, "dist_dyn", None) is not None else self.dist
         extra = None                                       # moving obstacles: not deeper into their swept area
-        if field is not self.dist and self.los:
+        if getattr(self, "dyn_extra", None) is not None and self.los:
             r0, c0 = self.occ.to_cell(rx, ry)
             inside = 0 <= r0 < self.free.shape[0] and 0 <= c0 < self.free.shape[1]
             extra = float(self.dyn_extra[r0, c0]) if inside else float(self.dyn_extra.max())
         if math.hypot(gx - rx, gy - ry) <= self.final_within and \
                 (not self.los or self._los(rx, ry, gx, gy, depth, extra)):
             return gx, gy, True
-        r, c = self.nearest_free(*self.occ.to_cell(rx, ry))
-        if not np.isfinite(field[r, c]):
-            if self.fallback is not None:
-                self.fallback_steps += 1
-                return self.fallback.waypoint(rx, ry, lookahead)
-            return gx, gy, False
-        travelled, cell = 0.0, self.occ.cell
         lookahead = self.lookahead if lookahead is None else lookahead
-        cells = [(r, c)]                                   # the path from the robot's (nearest free) cell
-        while travelled < lookahead:
-            best, best_d = None, field[r, c]
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    rr, cc = r + dr, c + dc
-                    if (dr or dc) and 0 <= rr < self.free.shape[0] and 0 <= cc < self.free.shape[1] \
-                            and field[rr, cc] < best_d:
-                        best, best_d = (rr, cc), field[rr, cc]
-            if best is None:
-                break
-            travelled += cell * math.hypot(best[0] - r, best[1] - c)
-            r, c = best
-            cells.append(best)
-            if best_d == 0:
-                break
+        if self.algorithm == "astar":                      # the robot's stretch of the A* path
+            cells = self._astar_cells(rx, ry, lookahead)
+            if cells is None:
+                return gx, gy, False
+            r, c = cells[-1]
+        else:                                              # descend the cost-to-go field
+            field = self.dist_dyn if getattr(self, "dist_dyn", None) is not None else self.dist
+            r, c = self.nearest_free(*self.occ.to_cell(rx, ry))
+            if not np.isfinite(field[r, c]):
+                if self.fallback is not None:
+                    self.fallback_steps += 1
+                    return self.fallback.waypoint(rx, ry, lookahead)
+                return gx, gy, False
+            travelled, cell = 0.0, self.occ.cell
+            cells = [(r, c)]                               # the path from the robot's (nearest free) cell
+            while travelled < lookahead:
+                best, best_d = None, field[r, c]
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        rr, cc = r + dr, c + dc
+                        if (dr or dc) and 0 <= rr < self.free.shape[0] and 0 <= cc < self.free.shape[1] \
+                                and field[rr, cc] < best_d:
+                            best, best_d = (rr, cc), field[rr, cc]
+                if best is None:
+                    break
+                travelled += cell * math.hypot(best[0] - r, best[1] - c)
+                r, c = best
+                cells.append(best)
+                if best_d == 0:
+                    break
         if self.los:
             for pr, pc in reversed(cells):
                 x, y = self.occ.to_world(pr, pc)

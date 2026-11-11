@@ -57,6 +57,8 @@ def main():
     parser.add_argument("--plan-dyn-replan", type=int, default=3, help="control steps between dynamic replans")
     parser.add_argument("--reverse-guard", type=float, default=0.0, metavar="M",
                         help="with backward driving: stop instead of reversing when something is within M m behind")
+    parser.add_argument("--plan-algorithm", choices=["field", "astar"], default="field",
+                        help="field: descend the Dijkstra cost-to-go field; astar: A* from the robot (same costs)")
     parser.add_argument("--plan-dyn-timed", action="store_true",
                         help="charge only where the robot would arrive about when the obstacle does")
     parser.add_argument("--shield", action="store_true",
@@ -113,10 +115,11 @@ def main():
                                open_passages=args.plan_open_passages, los=args.plan_los,
                                dyn_horizon=args.plan_dyn_horizon, dyn_radius=args.plan_dyn_radius,
                                dyn_cost=args.plan_dyn_cost, dyn_replan=args.plan_dyn_replan,
-                               dyn_timed=args.plan_dyn_timed)
+                               dyn_timed=args.plan_dyn_timed, algorithm=args.plan_algorithm)
         print(f"planner line of sight {args.plan_los}, open passages {args.plan_open_passages}, moving obstacles "
               f"{args.plan_dyn_horizon} s ahead (radius {args.plan_dyn_radius} m, cost {args.plan_dyn_cost}, every "
-              f"{args.plan_dyn_replan} steps, timed {args.plan_dyn_timed}), reverse guard {args.reverse_guard} m",
+              f"{args.plan_dyn_replan} steps, timed {args.plan_dyn_timed}), reverse guard {args.reverse_guard} m, "
+              f"algorithm {args.plan_algorithm}",
               flush=True)
         if args.waypoints:
             print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m"
@@ -255,6 +258,8 @@ def main():
             print("   last 8 steps (x, y, tilt deg):", track[-8:], flush=True)
     if args.reverse_guard > 0:
         print(f"reverse guard: {guarded} reversing steps turned into stops", flush=True)
+    if planner is not None and args.plan_algorithm == "astar":
+        print(f"A* searches: {planner.astar_searches}", flush=True)
     if shield is not None:
         print(f"safety shield: {shield.interventions} actions replaced", flush=True)
     if trace_file:

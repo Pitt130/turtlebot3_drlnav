@@ -38,13 +38,13 @@ class WaypointEnv(gymnasium.Wrapper):
                  slow_dist=0.0, slow_min_frac=0.3, collision_dist=0.13, scan_stack=1, scan_stack_skip=2,
                  plan_los=False, plan_open_passages=None, plan_dyn_horizon=0.0, plan_dyn_radius=0.40,
                  plan_dyn_cost=30.0, plan_dyn_replan=3, reverse_guard=0.0, plan_dyn_timed=False,
-                 obstacle_features=0):
+                 obstacle_features=0, plan_algorithm="field"):
         super().__init__(env)
         self.planner = make_planner(scene_dir, plan_map, plan_fallback_map, inflate=inflate, lookahead=lookahead,
                                     low_inflate=low_inflate, cost_weight=plan_cost, cost_dist=plan_cost_dist,
                                     open_passages=plan_open_passages, los=plan_los, dyn_horizon=plan_dyn_horizon,
                                     dyn_radius=plan_dyn_radius, dyn_cost=plan_dyn_cost, dyn_replan=plan_dyn_replan,
-                                    dyn_timed=plan_dyn_timed)
+                                    dyn_timed=plan_dyn_timed, algorithm=plan_algorithm)
         from waypoints import ObstacleTracker
         self.tracker = ObstacleTracker() if plan_dyn_horizon > 0 or obstacle_features > 0 else None
         self.reverse_guard = reverse_guard
