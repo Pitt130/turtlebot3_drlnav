@@ -344,11 +344,23 @@ class ObstacleTracker:
     def reset(self):
         self.prev, self.vel = {}, {}
 
-    def update(self, samples, now):
+    def update(self, samples, now, pose=None, ranges=None, radius=0.12, scan_offset=-0.032):
+        """With `pose` (x, y, heading) and the scan `ranges` (m, counterclockwise from ahead), obstacles hidden
+        behind something closer in their direction are left out, as a lidar tracker would not see them."""
         out = []
+        if pose is not None and ranges is not None:
+            ranges = np.asarray(ranges, dtype=np.float64)
+            hx, hy, hh = pose
+            lx, ly = hx + scan_offset * math.cos(hh), hy + scan_offset * math.sin(hh)
         for i, (t, x, y) in samples.items():
             if now - t > self.max_age:
                 continue
+            if pose is not None and ranges is not None:
+                d = math.hypot(x - lx, y - ly)
+                bearing = (math.atan2(y - ly, x - lx) - hh) % (2 * math.pi)
+                k = int(round(bearing / (2 * math.pi / len(ranges)))) % len(ranges)
+                if d - radius > 0.3 and ranges[k] < d - radius - 0.15:
+                    continue                             # something closer blocks the view
             p = self.prev.get(i)
             if p is None or t < p[0]:
                 self.prev[i] = (t, x, y)
@@ -377,6 +389,87 @@ def obstacle_features(rx, ry, heading, obstacles, n=3, max_range=3.0, max_speed=
                                 (c * vx + s * vy) / max_speed, (-s * vx + c * vy) / max_speed)
         k += 1
     return np.clip(out, -1.0, 1.0)
+
+
+class SafetyShield:
+    """Action filter for moving obstacles. Each step the policy's (v, w) is rolled out for `horizon` s as a
+    unicycle while every tracked obstacle keeps its velocity; the lidar origin must stay `d_obst` m from every
+    obstacle centre (collision = lidar 0.13 m from a 0.12 m radius obstacle, so 0.25 m) and `d_static` m from the
+    current scan points. An unsafe action is replaced by the safe candidate (stop, slow down, turn, back up)
+    closest to it, or, when none is safe, by the one that keeps the most clearance."""
+
+    def __init__(self, backward=False, horizon=1.5, dt=0.1, d_obst=0.32, d_static=0.15, v_max=0.22, w_max=2.0,
+                 obstacle_range=2.5, scan_offset=-0.032):
+        self.backward, self.horizon, self.dt = backward, horizon, dt
+        self.d_obst, self.d_static, self.v_max, self.w_max = d_obst, d_static, v_max, w_max
+        self.obstacle_range, self.scan_offset = obstacle_range, scan_offset
+        vs = (-0.15, -0.07, 0.0, 0.07, 0.15, 0.22) if backward else (0.0, 0.07, 0.15, 0.22)
+        self.candidates = [(v, w) for v in vs for w in (-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0)]
+        self.t = np.arange(1, int(round(horizon / dt)) + 1) * dt
+        self.interventions = 0
+
+    def to_velocity(self, action):
+        v = action[0] * self.v_max if self.backward else (action[0] + 1) / 2 * self.v_max
+        return float(v), float(action[1] * self.w_max)
+
+    def to_action(self, v, w):
+        a = v / self.v_max if self.backward else 2 * v / self.v_max - 1
+        return np.array([np.clip(a, -1, 1), np.clip(w / self.w_max, -1, 1)], dtype=np.float32)
+
+    def _rollout(self, v, w):
+        """Lidar origin positions (robot frame at t=0) along the horizon."""
+        if abs(w) < 1e-6:
+            th = np.zeros_like(self.t)
+            x, y = v * self.t, np.zeros_like(self.t)
+        else:
+            th = w * self.t
+            x, y = v / w * np.sin(th), v / w * (1 - np.cos(th))
+        return x + self.scan_offset * np.cos(th), y + self.scan_offset * np.sin(th)
+
+    def _clearance(self, v, w, obstacles, scan_xy):
+        px, py = self._rollout(v, w)
+        d_obst = np.inf
+        for ox, oy, vx, vy in obstacles:                 # robot frame
+            d_obst = min(d_obst, float(np.min(np.hypot(px - (ox + vx * self.t), py - (oy + vy * self.t)))))
+        d_static = np.inf
+        if len(scan_xy):
+            d_static = float(np.min(np.hypot(px[:, None] - scan_xy[None, :, 0], py[:, None] - scan_xy[None, :, 1])))
+        return d_obst, d_static
+
+    def filter(self, action, rx, ry, heading, obstacles, ranges):
+        """`obstacles` as (x, y, vx, vy) in the world, `ranges` the policy scan (m, counterclockwise from ahead)."""
+        c, s = math.cos(heading), math.sin(heading)
+        local = []
+        for x, y, vx, vy in obstacles:
+            dx, dy = x - rx, y - ry
+            if math.hypot(dx, dy) <= self.obstacle_range:
+                local.append((c * dx + s * dy, -s * dx + c * dy, c * vx + s * vy, -s * vx + c * vy))
+        if not local:
+            return action
+        ranges = np.asarray(ranges, dtype=np.float64)
+        ang = np.arange(len(ranges)) * 2 * math.pi / len(ranges)
+        near = ranges < 1.5
+        scan_xy = np.stack([self.scan_offset + ranges[near] * np.cos(ang[near]), ranges[near] * np.sin(ang[near])], 1)
+        v0, w0 = self.to_velocity(action)
+        do0, _ = self._clearance(v0, w0, local, scan_xy)
+        if do0 >= self.d_obst:
+            return action                  # no moving obstacle threatens this action; furniture is the policy's job
+        _, stay = self._clearance(0.0, 0.0, [], scan_xy)
+        thr = min(self.d_static, stay)     # a replacement must not get closer to furniture than standing still
+        best, best_key = None, None
+        for v, w in self.candidates:
+            do, ds = self._clearance(v, w, local, scan_xy)
+            change = math.hypot((v - v0) / self.v_max, (w - w0) / self.w_max)
+            if do >= self.d_obst and ds >= thr:
+                key = (0, change)
+            elif ds >= thr:
+                key = (1, -do)
+            else:
+                key = (2, -min(do / self.d_obst, ds / max(thr, 1e-3)))
+            if best_key is None or key < best_key:
+                best, best_key = (v, w), key
+        self.interventions += 1
+        return self.to_action(*best)
 
 
 def rear_clearance(ranges, half_angle=60.0):

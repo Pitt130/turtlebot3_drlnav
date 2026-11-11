@@ -59,6 +59,13 @@ def main():
                         help="with backward driving: stop instead of reversing when something is within M m behind")
     parser.add_argument("--plan-dyn-timed", action="store_true",
                         help="charge only where the robot would arrive about when the obstacle does")
+    parser.add_argument("--shield", action="store_true",
+                        help="filter each action against the tracked moving obstacles (waypoints.SafetyShield)")
+    parser.add_argument("--shield-horizon", type=float, default=1.5)
+    parser.add_argument("--shield-dist", type=float, default=0.32,
+                        help="smallest lidar-to-obstacle-centre distance the shield accepts over its horizon")
+    parser.add_argument("--visible-only", action="store_true",
+                        help="track only moving obstacles the scan sees (nothing closer in their direction)")
     parser.add_argument("--obstacle-features", type=int, default=0, metavar="N",
                         help="the model takes the N nearest moving obstacles in front of its observation (as trained)")
     parser.add_argument("--plan-cost-dist", type=float, default=0.25,
@@ -121,10 +128,15 @@ def main():
         if args.path_timeout:
             print(f"time limit: max({EPISODE_TIMEOUT_SECONDS} s, {args.path_timeout} x path / {SPEED_LINEAR_MAX} m/s)", flush=True)
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
-    from waypoints import ObstacleTracker, rear_clearance
+    from waypoints import ObstacleTracker, SafetyShield, rear_clearance
     from turtlebot3_drl.common.settings import ENABLE_BACKWARD, LIDAR_DISTANCE_CAP
     tracker = ObstacleTracker()
     guarded = 0
+    shield = SafetyShield(backward=ENABLE_BACKWARD, horizon=args.shield_horizon, d_obst=args.shield_dist) \
+        if args.shield else None
+    if shield is not None or args.visible_only:
+        print(f"safety shield {args.shield} ({args.shield_horizon} s, {args.shield_dist} m), "
+              f"visible obstacles only {args.visible_only}", flush=True)
     track_file = open(args.track_out, "w") if args.track_out else None
     if track_file:
         track_file.write("episode,step,x,y,tilt_deg,min_obstacle,goal_distance,lin,ang,outcome,dyn_x,dyn_y\n")
@@ -183,8 +195,11 @@ def main():
                                                           args.path_timeout * path_len / SPEED_LINEAR_MAX)
         while True:
             moving = []
-            if args.plan_dyn_horizon > 0 or n_feat:
-                moving = tracker.update(getattr(env, "_obstacle_samples", {}), env.time_sec)
+            if args.plan_dyn_horizon > 0 or n_feat or shield is not None:
+                scan_m = np.asarray(env.scan_ranges) * LIDAR_DISTANCE_CAP
+                moving = tracker.update(getattr(env, "_obstacle_samples", {}), env.time_sec,
+                                        pose=(env.robot_x, env.robot_y, env.robot_heading) if args.visible_only else None,
+                                        ranges=scan_m if args.visible_only else None)
             if args.waypoints:
                 if args.stall_recovery:
                     if args.plan_dyn_horizon > 0:
@@ -211,6 +226,9 @@ def main():
                     rear_clearance(np.asarray(env.scan_ranges) * LIDAR_DISTANCE_CAP) < args.reverse_guard:
                 action = np.array([0.0, action[1]], dtype=np.float32)     # stop rather than back into something
                 guarded += 1
+            if shield is not None:
+                action = shield.filter(action, env.robot_x, env.robot_y, env.robot_heading, moving,
+                                       np.asarray(env.scan_ranges) * LIDAR_DISTANCE_CAP)
             obs, r, term, trunc, info = env.step(action)
             dts.append(info["step_sim_dt"]); n += 1
             track.append((round(env.robot_x, 3), round(env.robot_y, 3), round(math.degrees(env.robot_tilt), 2)))
@@ -237,6 +255,8 @@ def main():
             print("   last 8 steps (x, y, tilt deg):", track[-8:], flush=True)
     if args.reverse_guard > 0:
         print(f"reverse guard: {guarded} reversing steps turned into stops", flush=True)
+    if shield is not None:
+        print(f"safety shield: {shield.interventions} actions replaced", flush=True)
     if trace_file:
         trace_file.close()
     env.close()
