@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--plan-dyn-replan", type=int, default=3, help="control steps between dynamic replans")
     parser.add_argument("--reverse-guard", type=float, default=0.0, metavar="M",
                         help="with backward driving: stop instead of reversing when something is within M m behind")
+    parser.add_argument("--algo", choices=["td3", "sac"], default="td3", help="the model's algorithm (as trained)")
     parser.add_argument("--plan-algorithm", choices=["field", "astar"], default="field",
                         help="field: descend the Dijkstra cost-to-go field; astar: A* from the robot (same costs)")
     parser.add_argument("--plan-dyn-timed", action="store_true",
@@ -87,8 +88,8 @@ def main():
     if args.model:
         import sys
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "sb3"))   # tomas_policy
-        from stable_baselines3 import TD3
-        policy = TD3.load(args.model, device="cuda")
+        from stable_baselines3 import SAC, TD3
+        policy = (SAC if args.algo == "sac" else TD3).load(args.model, device="cuda")
     stack = None
     n_feat = 5 * args.obstacle_features              # moving-obstacle inputs in front of the policy's observation
     if policy is not None and policy.observation_space.shape[0] - n_feat != env.observation_space.shape[0]:

@@ -14,7 +14,7 @@ import numpy as np
 import stable_baselines3
 import torch
 import torch.nn.functional as F
-from stable_baselines3 import TD3
+from stable_baselines3 import SAC, TD3
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CallbackList,
@@ -175,6 +175,19 @@ class TD3WithSeparateRandomWarmup(TD3):
 
 
 
+class SACWithSeparateRandomWarmup(SAC):
+    """SAC (--algo sac) with the same split as TD3WithSeparateRandomWarmup: uniformly random actions until
+    ``random_action_until``, gradient updates from ``learning_starts``. Exploration is the policy's own
+    entropy-regularised noise, so there is no action noise."""
+
+    def __init__(self, *args, random_action_until: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.random_action_until = int(self.learning_starts if random_action_until is None else random_action_until)
+
+    def _sample_action(self, learning_starts, action_noise=None, n_envs=1):
+        return super()._sample_action(self.random_action_until, action_noise=action_noise, n_envs=n_envs)
+
+
 class ActionDiagnostics(BaseCallback):
     """Record executed actions and simulation timing to identify spinning."""
 
@@ -227,6 +240,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also save the large replay buffer at every periodic checkpoint",
     )
+    parser.add_argument("--algo", choices=("td3", "sac"), default="td3",
+                        help="td3 (the Tomas-style TD3 below) or sac (SB3 SAC, 512x512, entropy-regularised; the "
+                             "TD3-only options --noise*, --critic-*, --max-grad-norm, --weight-init do not apply)")
+    parser.add_argument("--ent-coef", default="auto",
+                        help="SAC entropy coefficient: 'auto' (learned, SB3 default), 'auto_0.1' or a number")
     parser.add_argument("--learning-rate", type=float, default=0.003)
     parser.add_argument("--buffer-size", type=int, default=1_000_000)
     parser.add_argument("--learning-starts", type=int, default=128)
@@ -357,7 +375,7 @@ def copy_padded_weights(model, path: Path) -> None:
     """Load another TD3 model's policy weights into `model`. A first layer whose input grew (older scans
     stacked in front of the observation) keeps the old weights for the trailing inputs and gets zero
     weights for the new leading ones, so the network computes exactly what the old one did."""
-    old = TD3.load(str(path), device=model.device).policy.state_dict()
+    old = (SAC if isinstance(model, SAC) else TD3).load(str(path), device=model.device).policy.state_dict()
     new = model.policy.state_dict()
     if old.keys() != new.keys():
         raise ValueError(f"--init-from {path}: different policy architecture")
@@ -507,21 +525,47 @@ def main() -> None:
         args.critic_architecture != "sb3" or args.weight_init != "sb3"
     )
 
+    algo_class = SACWithSeparateRandomWarmup if args.algo == "sac" else TD3WithSeparateRandomWarmup
     if args.resume_model:
-        model = TD3WithSeparateRandomWarmup.load(
+        model = algo_class.load(
             str(args.resume_model), env=env, device=args.device
         )
         model.set_random_seed(args.seed)
-        model.action_noise = action_noise
         model.random_action_until = random_action_until
         model.actor_freeze_until = args.actor_freeze_steps
-        model.critic_loss_kind = args.critic_loss
-        model.max_grad_norm = args.max_grad_norm
+        if args.algo == "td3":
+            model.action_noise = action_noise
+            model.critic_loss_kind = args.critic_loss
+            model.max_grad_norm = args.max_grad_norm
         if args.resume_replay_buffer:
             model.load_replay_buffer(str(args.resume_replay_buffer))
         elif args.replay_warmup_steps > 0:
             model.learning_starts = model.num_timesteps + args.replay_warmup_steps
         reset_num_timesteps = False
+    elif args.algo == "sac":
+        ent_coef = args.ent_coef if args.ent_coef.startswith("auto") else float(args.ent_coef)
+        model = SACWithSeparateRandomWarmup(
+            policy="MlpPolicy",
+            env=env,
+            learning_rate=args.learning_rate,
+            buffer_size=args.buffer_size,
+            learning_starts=args.learning_starts,
+            random_action_until=random_action_until,
+            batch_size=args.batch_size,
+            tau=args.tau,
+            gamma=args.gamma,
+            train_freq=(1, "step"),
+            gradient_steps=1,
+            ent_coef=ent_coef,
+            policy_kwargs={"net_arch": [512, 512], "optimizer_class": optimizer_class},
+            verbose=1,
+            device=args.device,
+            seed=args.seed,
+        )
+        reset_num_timesteps = True
+        model.actor_freeze_until = args.actor_freeze_steps
+        if args.init_from:
+            copy_padded_weights(model, args.init_from)
     else:
         policy = ConfigurableTD3Policy if use_configurable_policy else "MlpPolicy"
         policy_kwargs = {
@@ -567,7 +611,7 @@ def main() -> None:
         CheckpointCallback(
             save_freq=args.checkpoint_freq,
             save_path=str(checkpoint_dir),
-            name_prefix="td3_stage4",
+            name_prefix=f"{args.algo}_stage4",
             save_replay_buffer=args.checkpoint_replay_buffer,
             save_vecnormalize=True,
             verbose=2,
@@ -585,10 +629,14 @@ def main() -> None:
         print(f"starting timestep: {model.num_timesteps}")
         print(f"gradient updates start at: {model.learning_starts}")
         print(f"uniformly random actions end at: {model.random_action_until}")
+        print(f"algorithm: {args.algo}")
         print(f"actor updates start at: {model.actor_freeze_until}")
-        print(f"critic loss: {model.critic_loss_kind}")
-        print(f"max gradient norm: {model.max_grad_norm}")
-        print(f"exploration noise: {args.noise}, sigma={args.noise_sigma}, dt={args.noise_dt}")
+        if args.algo == "td3":
+            print(f"critic loss: {model.critic_loss_kind}")
+            print(f"max gradient norm: {model.max_grad_norm}")
+            print(f"exploration noise: {args.noise}, sigma={args.noise_sigma}, dt={args.noise_dt}")
+        else:
+            print(f"entropy coefficient: {args.ent_coef}")
         print(f"optimizer: {args.optimizer}")
         print(f"critic architecture: {args.critic_architecture}")
         print(f"weight initialization: {args.weight_init}")
