@@ -130,28 +130,31 @@ class TD3WithSeparateRandomWarmup(TD3):
             self.critic.optimizer.step()
 
             if self._n_updates % self.policy_delay == 0:
-                actor_loss = -self.critic.q1_forward(
-                    replay_data.observations,
-                    self.actor(replay_data.observations),
-                ).mean()
-                actor_losses.append(actor_loss.item())
+                # Critic warm-up (--actor-freeze-steps): a policy taken into a new task keeps acting as it
+                # did while its critic learns the new values; only then do actor updates follow that critic.
+                if self.num_timesteps >= getattr(self, "actor_freeze_until", 0):
+                    actor_loss = -self.critic.q1_forward(
+                        replay_data.observations,
+                        self.actor(replay_data.observations),
+                    ).mean()
+                    actor_losses.append(actor_loss.item())
 
-                self.actor.optimizer.zero_grad()
-                actor_loss.backward()
-                if self.max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.actor.parameters(), self.max_grad_norm
+                    self.actor.optimizer.zero_grad()
+                    actor_loss.backward()
+                    if self.max_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.actor.parameters(), self.max_grad_norm
+                        )
+                    self.actor.optimizer.step()
+                    polyak_update(
+                        self.actor.parameters(),
+                        self.actor_target.parameters(),
+                        self.tau,
                     )
-                self.actor.optimizer.step()
 
                 polyak_update(
                     self.critic.parameters(),
                     self.critic_target.parameters(),
-                    self.tau,
-                )
-                polyak_update(
-                    self.actor.parameters(),
-                    self.actor_target.parameters(),
                     self.tau,
                 )
                 polyak_update(
@@ -227,6 +230,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=0.003)
     parser.add_argument("--buffer-size", type=int, default=1_000_000)
     parser.add_argument("--learning-starts", type=int, default=128)
+    parser.add_argument("--actor-freeze-steps", type=int, default=0,
+                        help="no actor updates before this total timestep (critic warm-up when fine-tuning a policy "
+                             "on a new task); target critics still follow")
     parser.add_argument(
         "--random-action-until",
         type=int,
@@ -301,6 +307,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-dyn-replan", type=int, default=3)
     parser.add_argument("--reverse-guard", type=float, default=0.0, metavar="M",
                         help="with backward driving: stop instead of reversing when something is within M m behind")
+    parser.add_argument("--plan-dyn-timed", action="store_true",
+                        help="charge only where the robot would arrive about when the obstacle does (passing behind it "
+                             "stays cheap); use a longer --plan-dyn-horizon (3 s)")
+    parser.add_argument("--obstacle-features", type=int, default=0, metavar="N",
+                        help="put the N nearest moving obstacles (robot-frame position and velocity) in front of the "
+                             "observation (waypoints.obstacle_features)")
     parser.add_argument("--plan-cost-dist", type=float, default=0.25,
                         help="with --plan-cost: distance beyond the inflated margin over which the extra cost fades")
     parser.add_argument("--stall-recovery", action=argparse.BooleanOptionalAction, default=True)
@@ -451,11 +463,12 @@ def main() -> None:
                                plan_los=args.plan_los, plan_open_passages=args.plan_open_passages,
                                plan_dyn_horizon=args.plan_dyn_horizon, plan_dyn_radius=args.plan_dyn_radius,
                                plan_dyn_cost=args.plan_dyn_cost, plan_dyn_replan=args.plan_dyn_replan,
-                               reverse_guard=args.reverse_guard)
+                               reverse_guard=args.reverse_guard, plan_dyn_timed=args.plan_dyn_timed,
+                               obstacle_features=args.obstacle_features)
         from turtlebot3_drl.common.settings import ENABLE_BACKWARD
         print(f"moving obstacles in the planner {args.plan_dyn_horizon} s ahead (radius {args.plan_dyn_radius} m, "
-              f"cost {args.plan_dyn_cost}, every {args.plan_dyn_replan} steps), reverse guard {args.reverse_guard} m",
-              flush=True)
+              f"cost {args.plan_dyn_cost}, every {args.plan_dyn_replan} steps, timed {args.plan_dyn_timed}), "
+              f"reverse guard {args.reverse_guard} m, obstacle features {args.obstacle_features}", flush=True)
         print(f"planner line of sight {args.plan_los}, open passages {args.plan_open_passages}, "
               f"backward driving {ENABLE_BACKWARD}, scan pool {os.environ.get('DRLNAV_SCAN_POOL', 'nearest')} "
               f"{os.environ.get('DRLNAV_SCAN_SAMPLES', 'default')} rays", flush=True)
@@ -489,6 +502,7 @@ def main() -> None:
         model.set_random_seed(args.seed)
         model.action_noise = action_noise
         model.random_action_until = random_action_until
+        model.actor_freeze_until = args.actor_freeze_steps
         model.critic_loss_kind = args.critic_loss
         model.max_grad_norm = args.max_grad_norm
         if args.resume_replay_buffer:
@@ -531,6 +545,7 @@ def main() -> None:
             seed=args.seed,
         )
         reset_num_timesteps = True
+        model.actor_freeze_until = args.actor_freeze_steps
         if args.init_from:
             copy_padded_weights(model, args.init_from)
 
@@ -558,6 +573,7 @@ def main() -> None:
         print(f"starting timestep: {model.num_timesteps}")
         print(f"gradient updates start at: {model.learning_starts}")
         print(f"uniformly random actions end at: {model.random_action_until}")
+        print(f"actor updates start at: {model.actor_freeze_until}")
         print(f"critic loss: {model.critic_loss_kind}")
         print(f"max gradient norm: {model.max_grad_norm}")
         print(f"exploration noise: {args.noise}, sigma={args.noise_sigma}, dt={args.noise_dt}")

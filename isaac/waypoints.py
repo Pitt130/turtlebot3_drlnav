@@ -40,7 +40,8 @@ class WaypointPlanner:
     def __init__(self, occupancy, inflate=0.18, lookahead=1.5, final_within=1.2, low_inflate=None,
                  stall_steps=30, stall_gain=0.10, recover_steps=20, recover_lookahead=1.5,
                  cost_weight=0.0, cost_dist=0.25, open_passages=None, los=False,
-                 dyn_horizon=0.0, dyn_radius=0.40, dyn_cost=30.0, dyn_replan=3, dyn_range=3.0, dyn_dt=0.25):
+                 dyn_horizon=0.0, dyn_radius=0.40, dyn_cost=30.0, dyn_replan=3, dyn_range=3.0, dyn_dt=0.25,
+                 dyn_timed=False, dyn_speed=0.2, dyn_window=(1.0, 0.7)):
         """`occupancy` is the raw grid; it is inflated by `inflate` (less than the sampler's
         0.25 m, so paths exist along furniture the policy can still pass) and LOW cells (below the
         lidar plane, invisible to the policy) by `low_inflate`.
@@ -72,6 +73,7 @@ class WaypointPlanner:
         # moving obstacles (set_obstacles); dyn_horizon = 0 turns the dynamic field off
         self.dyn_horizon, self.dyn_radius, self.dyn_cost = dyn_horizon, dyn_radius, dyn_cost
         self.dyn_replan, self.dyn_range, self.dyn_dt = dyn_replan, dyn_range, dyn_dt
+        self.dyn_timed, self.dyn_speed, self.dyn_window = dyn_timed, dyn_speed, tuple(dyn_window)
         n = int(math.ceil(dyn_radius / self.occ.cell))
         disc = np.array([(dr, dc) for dr in range(-n, n + 1) for dc in range(-n, n + 1) if dr * dr + dc * dc <= n * n])
         self._disc = (disc[:, 0], disc[:, 1])
@@ -90,16 +92,29 @@ class WaypointPlanner:
         detection (path_length) keep the static field."""
         self.obstacles = list(obstacles)
 
-    def _dynamic_cost(self, obstacles):
+    def _dynamic_cost(self, obstacles, rx=None, ry=None):
+        """Extra cost per cell for the moving obstacles. Untimed: every cell an obstacle sweeps within the
+        horizon, more for the near future. Timed (dyn_timed): only the cells the robot, going straight at
+        `dyn_speed`, would reach between dyn_window[0] s before and dyn_window[1] s after the obstacle, so
+        passing behind an obstacle (or well ahead of it) stays cheap."""
         extra = np.zeros(self.free.shape)
         rows, cols = self.free.shape
+        timed = self.dyn_timed and rx is not None
         for x, y, vx, vy in obstacles:
             for t in np.arange(0.0, self.dyn_horizon + 1e-9, self.dyn_dt):
                 r, c = self.occ.to_cell(x + vx * t, y + vy * t)
                 rr, cc = self._disc[0] + r, self._disc[1] + c
                 ok = (rr >= 0) & (rr < rows) & (cc >= 0) & (cc < cols)
-                cost = self.dyn_cost * (1.0 - 0.5 * t / self.dyn_horizon)
-                extra[rr[ok], cc[ok]] = np.maximum(extra[rr[ok], cc[ok]], cost)
+                rr, cc = rr[ok], cc[ok]
+                if timed:
+                    arrive = np.hypot(self.occ.origin[0] + cc * self.occ.cell - rx,
+                                      self.occ.origin[1] + rr * self.occ.cell - ry) / self.dyn_speed
+                    keep = (arrive >= t - self.dyn_window[0]) & (arrive <= t + self.dyn_window[1])
+                    rr, cc = rr[keep], cc[keep]
+                    cost = self.dyn_cost
+                else:
+                    cost = self.dyn_cost * (1.0 - 0.5 * t / self.dyn_horizon)
+                extra[rr, cc] = np.maximum(extra[rr, cc], cost)
         return extra
 
     def _update_dynamic(self, rx, ry):
@@ -108,7 +123,7 @@ class WaypointPlanner:
             self._reset_dynamic()
             return
         if self.dist_dyn is None or self.dyn_count % self.dyn_replan == 0:
-            self.dyn_extra = self._dynamic_cost(near)
+            self.dyn_extra = self._dynamic_cost(near, rx, ry)
             self.dist_dyn = self._cost_field(*self.goal_cell, extra=self.dyn_extra)
             self.dyn_replans += 1
         self.dyn_count += 1
@@ -343,6 +358,25 @@ class ObstacleTracker:
             vx, vy = self.vel.get(i, (0.0, 0.0))
             out.append((x, y, vx, vy))
         return out
+
+
+def obstacle_features(rx, ry, heading, obstacles, n=3, max_range=3.0, max_speed=0.6):
+    """Policy input for the `n` nearest moving obstacles within `max_range`: per obstacle [present, x, y, vx, vy]
+    in the robot frame (x ahead, y left), positions over max_range and velocities over max_speed, clipped to
+    [-1, 1]; missing obstacles are all zeros. Goes in front of the observation (train.py --init-from then
+    gives these inputs zero weights)."""
+    c, s = math.cos(heading), math.sin(heading)
+    near = sorted(((math.hypot(x - rx, y - ry), x, y, vx, vy) for x, y, vx, vy in obstacles), key=lambda o: o[0])
+    out = np.zeros(5 * n, dtype=np.float32)
+    k = 0
+    for d, x, y, vx, vy in near:
+        if k == n or d > max_range:
+            break
+        dx, dy = x - rx, y - ry
+        out[5 * k:5 * k + 5] = (1.0, (c * dx + s * dy) / max_range, (-s * dx + c * dy) / max_range,
+                                (c * vx + s * vy) / max_speed, (-s * vx + c * vy) / max_speed)
+        k += 1
+    return np.clip(out, -1.0, 1.0)
 
 
 def rear_clearance(ranges, half_angle=60.0):

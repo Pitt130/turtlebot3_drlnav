@@ -57,6 +57,10 @@ def main():
     parser.add_argument("--plan-dyn-replan", type=int, default=3, help="control steps between dynamic replans")
     parser.add_argument("--reverse-guard", type=float, default=0.0, metavar="M",
                         help="with backward driving: stop instead of reversing when something is within M m behind")
+    parser.add_argument("--plan-dyn-timed", action="store_true",
+                        help="charge only where the robot would arrive about when the obstacle does")
+    parser.add_argument("--obstacle-features", type=int, default=0, metavar="N",
+                        help="the model takes the N nearest moving obstacles in front of its observation (as trained)")
     parser.add_argument("--plan-cost-dist", type=float, default=0.25,
                         help="with --plan-cost: distance beyond the inflated margin over which the extra cost fades")
     parser.add_argument("--stall-recovery", action="store_true",
@@ -77,13 +81,16 @@ def main():
         from stable_baselines3 import TD3
         policy = TD3.load(args.model, device="cuda")
     stack = None
-    if policy is not None and policy.observation_space.shape[0] != env.observation_space.shape[0]:
+    n_feat = 5 * args.obstacle_features              # moving-obstacle inputs in front of the policy's observation
+    if policy is not None and policy.observation_space.shape[0] - n_feat != env.observation_space.shape[0]:
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
         from waypoints import ScanStack
         scan_size = env.observation_space.shape[0] - 4
-        frames = 1 + (policy.observation_space.shape[0] - env.observation_space.shape[0]) // scan_size
+        frames = 1 + (policy.observation_space.shape[0] - n_feat - env.observation_space.shape[0]) // scan_size
         stack = ScanStack(frames, args.scan_stack_skip, scan_size)
         print(f"scans per observation: {frames}, {args.scan_stack_skip} steps apart", flush=True)
+    if n_feat:
+        print(f"moving-obstacle inputs: {args.obstacle_features} nearest", flush=True)
     planner = None
     if args.waypoints or args.path_timeout:
         import glob, sys
@@ -98,10 +105,12 @@ def main():
                                cost_weight=args.plan_cost, cost_dist=args.plan_cost_dist,
                                open_passages=args.plan_open_passages, los=args.plan_los,
                                dyn_horizon=args.plan_dyn_horizon, dyn_radius=args.plan_dyn_radius,
-                               dyn_cost=args.plan_dyn_cost, dyn_replan=args.plan_dyn_replan)
+                               dyn_cost=args.plan_dyn_cost, dyn_replan=args.plan_dyn_replan,
+                               dyn_timed=args.plan_dyn_timed)
         print(f"planner line of sight {args.plan_los}, open passages {args.plan_open_passages}, moving obstacles "
               f"{args.plan_dyn_horizon} s ahead (radius {args.plan_dyn_radius} m, cost {args.plan_dyn_cost}, every "
-              f"{args.plan_dyn_replan} steps), reverse guard {args.reverse_guard} m", flush=True)
+              f"{args.plan_dyn_replan} steps, timed {args.plan_dyn_timed}), reverse guard {args.reverse_guard} m",
+              flush=True)
         if args.waypoints:
             print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m"
                   f" (below-lidar obstacles {args.plan_low_inflate or args.plan_inflate} m),"
@@ -173,10 +182,13 @@ def main():
                 env.episode_deadline = env.time_sec + max(EPISODE_TIMEOUT_SECONDS,
                                                           args.path_timeout * path_len / SPEED_LINEAR_MAX)
         while True:
+            moving = []
+            if args.plan_dyn_horizon > 0 or n_feat:
+                moving = tracker.update(getattr(env, "_obstacle_samples", {}), env.time_sec)
             if args.waypoints:
                 if args.stall_recovery:
                     if args.plan_dyn_horizon > 0:
-                        planner.set_obstacles(tracker.update(getattr(env, "_obstacle_samples", {}), env.time_sec))
+                        planner.set_obstacles(moving)
                     wx, wy, reachable, recovering = planner.step(env.robot_x, env.robot_y)
                 else:
                     wx, wy, reachable = planner.waypoint(env.robot_x, env.robot_y)
@@ -190,6 +202,10 @@ def main():
                 policy_obs = obs
             if stack is not None:
                 policy_obs = stack.push(policy_obs) if n else stack.reset(policy_obs)
+            if n_feat:
+                from waypoints import obstacle_features
+                policy_obs = np.concatenate([obstacle_features(env.robot_x, env.robot_y, env.robot_heading, moving,
+                                                               args.obstacle_features), policy_obs]).astype(np.float32)
             action = policy.predict(policy_obs, deterministic=True)[0] if policy is not None else rng.uniform(-1, 1, 2).astype(np.float32)
             if args.reverse_guard > 0 and ENABLE_BACKWARD and action[0] < 0 and \
                     rear_clearance(np.asarray(env.scan_ranges) * LIDAR_DISTANCE_CAP) < args.reverse_guard:

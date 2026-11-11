@@ -37,15 +37,18 @@ class WaypointEnv(gymnasium.Wrapper):
                  plan_cost=0.0, plan_cost_dist=0.25, plan_fallback_map=None,
                  slow_dist=0.0, slow_min_frac=0.3, collision_dist=0.13, scan_stack=1, scan_stack_skip=2,
                  plan_los=False, plan_open_passages=None, plan_dyn_horizon=0.0, plan_dyn_radius=0.40,
-                 plan_dyn_cost=30.0, plan_dyn_replan=3, reverse_guard=0.0):
+                 plan_dyn_cost=30.0, plan_dyn_replan=3, reverse_guard=0.0, plan_dyn_timed=False,
+                 obstacle_features=0):
         super().__init__(env)
         self.planner = make_planner(scene_dir, plan_map, plan_fallback_map, inflate=inflate, lookahead=lookahead,
                                     low_inflate=low_inflate, cost_weight=plan_cost, cost_dist=plan_cost_dist,
                                     open_passages=plan_open_passages, los=plan_los, dyn_horizon=plan_dyn_horizon,
-                                    dyn_radius=plan_dyn_radius, dyn_cost=plan_dyn_cost, dyn_replan=plan_dyn_replan)
+                                    dyn_radius=plan_dyn_radius, dyn_cost=plan_dyn_cost, dyn_replan=plan_dyn_replan,
+                                    dyn_timed=plan_dyn_timed)
         from waypoints import ObstacleTracker
-        self.tracker = ObstacleTracker() if plan_dyn_horizon > 0 else None
+        self.tracker = ObstacleTracker() if plan_dyn_horizon > 0 or obstacle_features > 0 else None
         self.reverse_guard = reverse_guard
+        self.n_obstacle_features, self._obstacles = obstacle_features, []
         self.stall_recovery, self.path_reward = stall_recovery, path_reward
         self.v_max, self.w_max = speed_linear_max, speed_angular_max
         from turtlebot3_drl.common.settings import ENABLE_BACKWARD
@@ -65,6 +68,19 @@ class WaypointEnv(gymnasium.Wrapper):
             self.observation_space = gymnasium.spaces.Box(
                 low=np.concatenate([low[:n]] * (scan_stack - 1) + [low]),
                 high=np.concatenate([high[:n]] * (scan_stack - 1) + [high]), dtype=np.float32)
+        if obstacle_features > 0:                # moving obstacles in front of everything (waypoints.obstacle_features)
+            k = 5 * obstacle_features
+            self.observation_space = gymnasium.spaces.Box(
+                low=np.concatenate([-np.ones(k, np.float32), self.observation_space.low]),
+                high=np.concatenate([np.ones(k, np.float32), self.observation_space.high]), dtype=np.float32)
+
+    def _with_features(self, stacked):
+        if not self.n_obstacle_features:
+            return stacked
+        from waypoints import obstacle_features
+        e = self._robot()
+        f = obstacle_features(e.robot_x, e.robot_y, e.robot_heading, self._obstacles, self.n_obstacle_features)
+        return np.concatenate([f, stacked]).astype(np.float32)
 
     def _robot(self):
         e = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
@@ -73,7 +89,9 @@ class WaypointEnv(gymnasium.Wrapper):
     def _waypoint_obs(self, obs):
         e = self._robot()
         if self.tracker is not None:
-            self.planner.set_obstacles(self.tracker.update(getattr(e, "_obstacle_samples", {}), e.time_sec))
+            self._obstacles = self.tracker.update(getattr(e, "_obstacle_samples", {}), e.time_sec)
+            if self.planner.dyn_horizon > 0:
+                self.planner.set_obstacles(self._obstacles)
         if self.stall_recovery:
             wx, wy, _, _ = self.planner.step(e.robot_x, e.robot_y)
         else:
@@ -89,7 +107,7 @@ class WaypointEnv(gymnasium.Wrapper):
         self.planner.reset_progress()
         self.prev_len = self.planner.path_length(e.robot_x, e.robot_y)
         info = dict(info, path_length=self.prev_len)
-        return self.stack.reset(self._waypoint_obs(obs)), info
+        return self._with_features(self.stack.reset(self._waypoint_obs(obs))), info
 
     def step(self, action):
         if self.reverse_guard > 0 and self.backward and float(action[0]) < 0:
@@ -119,4 +137,4 @@ class WaypointEnv(gymnasium.Wrapper):
                       + (-self.obstacle_penalty if e.obstacle_distance < self.obstacle_penalty_dist else 0.0))
             if terminated or truncated:
                 reward += TERMINAL.get(int(info.get("success", 0)), 0.0)
-        return self.stack.push(obs), float(reward), terminated, truncated, info
+        return self._with_features(self.stack.push(obs)), float(reward), terminated, truncated, info
