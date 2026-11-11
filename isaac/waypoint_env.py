@@ -11,6 +11,8 @@ around a wall) and the heading term uses the waypoint direction. With slow_dist 
 of the speed term drops linearly inside slow_dist of the nearest obstacle, to slow_min_frac of
 v_max at the collision distance, and going faster than that target is penalized too. With scan_stack > 1
 older scans go in front of the observation (waypoints.ScanStack), so moving obstacles can be told apart.
+With backward driving (DRLNAV_BACKWARD=1) the speed term sees the signed speed, so reversing costs more
+than stopping and the policy reverses only when that pays off.
 """
 import glob
 import math
@@ -33,12 +35,16 @@ class WaypointEnv(gymnasium.Wrapper):
                  path_reward=True, speed_linear_max=0.22, speed_angular_max=2.0, max_goal_distance=None,
                  obstacle_penalty_dist=0.15, obstacle_penalty=10.0, progress_gain=50.0, plan_map="occupancy_v4",
                  plan_cost=0.0, plan_cost_dist=0.25, plan_fallback_map=None,
-                 slow_dist=0.0, slow_min_frac=0.3, collision_dist=0.13, scan_stack=1, scan_stack_skip=2):
+                 slow_dist=0.0, slow_min_frac=0.3, collision_dist=0.13, scan_stack=1, scan_stack_skip=2,
+                 plan_los=False, plan_open_passages=None):
         super().__init__(env)
         self.planner = make_planner(scene_dir, plan_map, plan_fallback_map, inflate=inflate, lookahead=lookahead,
-                                    low_inflate=low_inflate, cost_weight=plan_cost, cost_dist=plan_cost_dist)
+                                    low_inflate=low_inflate, cost_weight=plan_cost, cost_dist=plan_cost_dist,
+                                    open_passages=plan_open_passages, los=plan_los)
         self.stall_recovery, self.path_reward = stall_recovery, path_reward
         self.v_max, self.w_max = speed_linear_max, speed_angular_max
+        from turtlebot3_drl.common.settings import ENABLE_BACKWARD
+        self.backward = ENABLE_BACKWARD          # the environment maps the linear action the same way
         if max_goal_distance is None:
             from turtlebot3_drl.drl_environment.drl_environment_gymnasium import MAX_GOAL_DISTANCE
             max_goal_distance = MAX_GOAL_DISTANCE
@@ -88,7 +94,7 @@ class WaypointEnv(gymnasium.Wrapper):
                 progress = float(np.clip(self.prev_len - length, -0.2, 0.2))   # nearest-cell jumps are not progress
             self.prev_len = length
             a = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
-            v = (a[0] + 1) / 2 * self.v_max
+            v = a[0] * self.v_max if self.backward else (a[0] + 1) / 2 * self.v_max
             w = a[1] * self.w_max
             angle = float(obs[-3]) * math.pi                    # waypoint bearing, as the policy sees it
             v_target = self.v_max

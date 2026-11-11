@@ -17,6 +17,12 @@ use narrow passages. cost_weight = 0 keeps the original step-count wavefront.
 `fallback` (set after construction) is a second planner, e.g. on the v4 grid, that takes over
 wherever this planner's grid has no path from the robot to the goal: a finer grid can close a
 passage the start/goal sampler (v4) still counts as open.
+
+`open_passages` (radius, low radius) opens the narrow passages the margins close (Occupancy.inflated_open),
+so a fine grid needs no fallback. With `los` the waypoint is the farthest point up to `lookahead` along the
+path that the robot sees in a straight line without going deeper into the margin than it already is, and
+within `final_within` the goal replaces the waypoint only when it is seen that way: the robot no longer
+cuts corners through the margin towards a waypoint or goal behind a chair or table leg.
 """
 import heapq
 import math
@@ -29,7 +35,7 @@ from grscene import FREE, LOW, _dilate
 class WaypointPlanner:
     def __init__(self, occupancy, inflate=0.18, lookahead=1.5, final_within=1.2, low_inflate=None,
                  stall_steps=30, stall_gain=0.10, recover_steps=20, recover_lookahead=1.5,
-                 cost_weight=0.0, cost_dist=0.25):
+                 cost_weight=0.0, cost_dist=0.25, open_passages=None, los=False):
         """`occupancy` is the raw grid; it is inflated by `inflate` (less than the sampler's
         0.25 m, so paths exist along furniture the policy can still pass) and LOW cells (below the
         lidar plane, invisible to the policy) by `low_inflate`.
@@ -37,7 +43,11 @@ class WaypointPlanner:
         Stall recovery (step()): when the path length to the goal has not dropped by `stall_gain`
         for `stall_steps` control steps, the waypoint moves `recover_lookahead` ahead for
         `recover_steps` steps, and the stall is counted (the path_blocked signal)."""
-        self.occ = occupancy.inflated_split(inflate, low_inflate) if low_inflate else occupancy.inflated(inflate)
+        if open_passages:
+            self.occ, self.passage = occupancy.inflated_open(inflate, low_inflate or inflate, *open_passages)
+        else:
+            self.occ = occupancy.inflated_split(inflate, low_inflate) if low_inflate else occupancy.inflated(inflate)
+            self.passage = None
         self.stall_steps, self.stall_gain = stall_steps, stall_gain
         self.recover_steps, self.recover_lookahead = recover_steps, recover_lookahead
         self.reset_progress()
@@ -52,6 +62,40 @@ class WaypointPlanner:
         self.fallback_steps = 0
         self.penalty = self._clearance_penalty(occupancy, inflate, low_inflate or inflate, cost_dist) \
             if cost_weight > 0 else None
+        self.los = los
+        self.depth = self._margin_depth(occupancy, inflate, low_inflate or inflate) if los else None
+
+    def _margin_depth(self, occupancy, inflate, low_inflate):
+        """Per cell, how far (m) inside the planning margin it lies: 0 on FREE cells (opened passages
+        included), at least 1 mm on every other cell, the full margin on obstacles."""
+        cell, grid = occupancy.cell, occupancy.grid
+        depth = np.zeros(grid.shape)
+        for mask, margin, pad in (((grid != FREE) & (grid != LOW), inflate, True), (grid == LOW, low_inflate, False)):
+            dist = np.full(grid.shape, np.inf)
+            for n in range(int(math.ceil(margin / cell)), 0, -1):   # smallest disc that reaches the cell wins
+                dist[_dilate(mask, n, pad)] = n * cell
+            dist[mask] = 0.0
+            depth = np.maximum(depth, np.clip(margin - dist, 0.0, None))
+        depth[~self.free] = np.maximum(depth[~self.free], 1e-3)
+        depth[self.free] = 0.0
+        return depth
+
+    def _depth_at(self, x, y):
+        r, c = self.occ.to_cell(x, y)
+        if 0 <= r < self.depth.shape[0] and 0 <= c < self.depth.shape[1]:
+            return float(self.depth[r, c])
+        return float(self.depth.max())
+
+    def _los(self, x0, y0, x1, y1, max_depth):
+        """True when the straight line (x0, y0) -> (x1, y1) stays within `max_depth` of the margin's edge."""
+        n = max(2, int(math.hypot(x1 - x0, y1 - y0) / (self.occ.cell / 2)) + 1)
+        t = np.linspace(0.0, 1.0, n)
+        rows = np.rint((y0 + t * (y1 - y0) - self.occ.origin[1]) / self.occ.cell).astype(int)
+        cols = np.rint((x0 + t * (x1 - x0) - self.occ.origin[0]) / self.occ.cell).astype(int)
+        inside = (rows >= 0) & (rows < self.depth.shape[0]) & (cols >= 0) & (cols < self.depth.shape[1])
+        if not inside.all():
+            return False
+        return bool((self.depth[rows, cols] <= max_depth + 1e-9).all())
 
     @staticmethod
     def _clearance_penalty(occupancy, inflate, low_inflate, cost_dist):
@@ -130,9 +174,12 @@ class WaypointPlanner:
 
         Returns (x, y, reachable). Unreachable (robot cut off from the goal on the grid)
         falls back to the goal itself, so the policy behaves as without the planner.
+        With `los`, see the module docstring: the farthest path point the robot sees within the
+        lookahead, and the goal only when it is seen.
         """
         gx, gy = self.goal
-        if math.hypot(gx - rx, gy - ry) <= self.final_within:
+        depth = self._depth_at(rx, ry) if self.los else None
+        if math.hypot(gx - rx, gy - ry) <= self.final_within and (not self.los or self._los(rx, ry, gx, gy, depth)):
             return gx, gy, True
         r, c = self.nearest_free(*self.occ.to_cell(rx, ry))
         if not np.isfinite(self.dist[r, c]):
@@ -142,6 +189,7 @@ class WaypointPlanner:
             return gx, gy, False
         travelled, cell = 0.0, self.occ.cell
         lookahead = self.lookahead if lookahead is None else lookahead
+        cells = [(r, c)]                                   # the path from the robot's (nearest free) cell
         while travelled < lookahead:
             best, best_d = None, self.dist[r, c]
             for dr in (-1, 0, 1):
@@ -154,8 +202,15 @@ class WaypointPlanner:
                 break
             travelled += cell * math.hypot(best[0] - r, best[1] - c)
             r, c = best
+            cells.append(best)
             if best_d == 0:
                 break
+        if self.los:
+            for pr, pc in reversed(cells):
+                x, y = self.occ.to_world(pr, pc)
+                if self._los(rx, ry, x, y, depth):
+                    return x, y, True
+            r, c = cells[0]                                # nothing seen: back to the nearest free cell first
         x, y = self.occ.to_world(r, c)
         return x, y, True
 

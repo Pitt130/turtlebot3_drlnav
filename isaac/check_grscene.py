@@ -45,6 +45,10 @@ def main():
                              "as much (cost-to-go field, octile steps); 0 = plain step-count wavefront")
     parser.add_argument("--plan-fallback-map", default=None,
                         help="occupancy grid prefix (e.g. occupancy_v4) planned on where --plan-map has no path")
+    parser.add_argument("--plan-los", action="store_true",
+                        help="waypoint = farthest path point seen in a straight line (waypoints.WaypointPlanner los)")
+    parser.add_argument("--plan-open-passages", type=float, nargs=2, metavar=("RADIUS", "LOW_RADIUS"),
+                        help="open passages the margins close where this clearance remains (Occupancy.inflated_open)")
     parser.add_argument("--plan-cost-dist", type=float, default=0.25,
                         help="with --plan-cost: distance beyond the inflated margin over which the extra cost fades")
     parser.add_argument("--stall-recovery", action="store_true",
@@ -83,7 +87,9 @@ def main():
         from waypoints import make_planner
         planner = make_planner(args.scene, args.plan_map, args.plan_fallback_map, inflate=args.plan_inflate,
                                lookahead=args.waypoints or 1.5, low_inflate=args.plan_low_inflate,
-                               cost_weight=args.plan_cost, cost_dist=args.plan_cost_dist)
+                               cost_weight=args.plan_cost, cost_dist=args.plan_cost_dist,
+                               open_passages=args.plan_open_passages, los=args.plan_los)
+        print(f"planner line of sight {args.plan_los}, open passages {args.plan_open_passages}", flush=True)
         if args.waypoints:
             print(f"waypoint planner: lookahead {args.waypoints} m, planning grid inflated {args.plan_inflate} m"
                   f" (below-lidar obstacles {args.plan_low_inflate or args.plan_inflate} m),"

@@ -75,6 +75,53 @@ class Occupancy:
         out[grown & (self.grid == FREE)] = OCCUPIED
         return Occupancy(self.origin, self.cell, out)
 
+    def inflated_open(self, radius, low_radius, open_radius=None, open_low_radius=None, min_area=0.5):
+        """inflated_split(radius, low_radius) with narrow passages opened. A free region of at least
+        `min_area` m2 that the margins cut off from the largest one, but that reaches it through cells at
+        least `open_radius` from obstacles (`open_low_radius` from LOW cells), is joined to it along its
+        shortest such 4-connected corridor, widened by 2 cells where the smaller margins allow. Returns
+        (grid, passage) with the opened cells FREE in the grid and True in `passage`."""
+        grid = self.inflated_split(radius, low_radius)
+        passage = np.zeros(self.grid.shape, dtype=bool)
+        if not open_radius:
+            return grid, passage
+        small = self.inflated_split(open_radius, open_low_radius or open_radius).grid == FREE
+        labels, sizes = grid.components()
+        if not sizes:
+            return grid, passage
+        main = int(np.argmax(sizes))
+        joined = labels == main
+        others = {k for k, n in enumerate(sizes) if k != main and n * self.cell ** 2 >= min_area}
+        rows, cols = self.grid.shape
+        while others:
+            seen = joined.copy()                       # breadth-first from everything joined so far
+            parent = {}
+            queue = deque(map(tuple, np.argwhere(joined)))
+            hit = None
+            while queue and hit is None:
+                r, c = queue.popleft()
+                for rr, cc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                    if 0 <= rr < rows and 0 <= cc < cols and small[rr, cc] and not seen[rr, cc]:
+                        seen[rr, cc] = True
+                        parent[(rr, cc)] = (r, c)
+                        if labels[rr, cc] in others:
+                            hit = (rr, cc)
+                            break
+                        queue.append((rr, cc))
+            if hit is None:
+                break
+            path = np.zeros(self.grid.shape, dtype=bool)
+            cell = parent[hit]
+            while not joined[cell]:
+                path[cell] = True
+                cell = parent[cell]
+            corridor = (_dilate(path, 2, False) & small & (grid.grid != FREE)) | path
+            passage |= corridor
+            joined |= corridor | (labels == labels[hit])
+            others.discard(int(labels[hit]))
+        grid.grid[passage] = FREE
+        return grid, passage
+
     def components(self):
         """Label 4-connected FREE regions; -1 elsewhere. Returns (labels, sizes)."""
         labels = np.full(self.grid.shape, -1, dtype=np.int32)
@@ -151,15 +198,26 @@ class StartGoalSampler:
     `separation` m from the previous goal, as in the stage goal lists.
     """
 
-    def __init__(self, occupancy, inflate=0.25, goal_min=1.5, goal_max=5.5, path_max=7.0, separation=2.0, seed=None):
-        self.occ = occupancy.inflated(inflate)
+    def __init__(self, occupancy, inflate=0.25, goal_min=1.5, goal_max=5.5, path_max=7.0, separation=2.0, seed=None,
+                 low_inflate=None, open_passages=None):
+        """`low_inflate` gives LOW cells their own margin and `open_passages` (radius, low radius) joins regions
+        the margins cut off through narrower passages (Occupancy.inflated_open), as the waypoint planner does,
+        so every start and goal is reachable on the planner's grid. Starts and goals are never placed in an
+        opened passage: they keep the full margin."""
+        passage = None
+        if low_inflate is None and not open_passages:
+            self.occ = occupancy.inflated(inflate)
+        else:
+            self.occ, passage = occupancy.inflated_open(inflate, inflate if low_inflate is None else low_inflate,
+                                                        *(open_passages or (None, None)))
         self.goal_min, self.goal_max, self.path_max, self.separation = goal_min, goal_max, path_max, separation
         labels, sizes = self.occ.components()
         if not sizes:
             raise RuntimeError("no free space in the occupancy grid")
         self.main = int(np.argmax(sizes))
         self.occ.grid[(self.occ.grid == FREE) & (labels != self.main)] = OCCUPIED   # closets, balconies etc.
-        self.cells = np.argwhere(self.occ.grid == FREE)
+        free = self.occ.grid == FREE
+        self.cells = np.argwhere(free if passage is None else free & ~passage)
         self.rng = np.random.default_rng(seed)
         self.area = len(self.cells) * self.occ.cell ** 2
 

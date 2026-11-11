@@ -3,7 +3,7 @@ import os as _os
 #                           GENERAL SETTINGS                            #
 # ===================================================================== #
 
-ENABLE_BACKWARD          = False    # Enable backward movement of the robot
+ENABLE_BACKWARD          = _os.environ.get("DRLNAV_BACKWARD", "0") == "1"   # Enable backward movement of the robot (linear action -1..1 -> -v..v)
 ENABLE_STACKING          = False    # Enable processing multiple consecutive scan frames at every observation step
 ENABLE_VISUAL            = False    # Meant to be used only during evaluation/testing phase
 ENABLE_TRUE_RANDOM_GOALS = False    # If false, goals are selected semi-randomly from a list of known valid goal positions

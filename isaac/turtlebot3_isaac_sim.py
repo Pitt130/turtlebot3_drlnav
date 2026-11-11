@@ -78,6 +78,14 @@ def main():
     parser.add_argument("--goal-max", type=float, default=5.5)
     parser.add_argument("--path-max", type=float, default=7.0, help="grscene: max grid path length to a goal (m)")
     parser.add_argument("--inflate", type=float, default=0.25, help="grscene: clearance from obstacles for poses (m)")
+    parser.add_argument("--sampler-map", default=None,
+                        help="grscene: occupancy grid prefix in the scene folder for starts, goals and moving obstacles, "
+                             "e.g. occupancy_v6 (default: the v4 scan)")
+    parser.add_argument("--low-inflate", type=float, default=None,
+                        help="grscene: clearance from LOW cells for poses (default --inflate)")
+    parser.add_argument("--open-passages", type=float, nargs=2, default=None, metavar=("RADIUS", "LOW_RADIUS"),
+                        help="grscene: join regions the margins cut off through passages with this clearance, as the "
+                             "planner's --plan-open-passages (starts and goals keep the full margin)")
     parser.add_argument("--seed", type=int, help="grscene: seed for start/goal sampling")
     parser.add_argument("--episode-log", type=Path, help="grscene: CSV of every start and goal")
     parser.add_argument("--reset-every-episode", action="store_true",
@@ -258,8 +266,16 @@ def main():
         world.step(render=False)
         t0 = time.time()
         occupancy = build_occupancy(grscene)
-        sampler = StartGoalSampler(occupancy, inflate=args.inflate, goal_min=args.goal_min, goal_max=args.goal_max,
-                                   path_max=args.path_max, seed=args.seed)
+        poses_grid = occupancy
+        if args.sampler_map:
+            import glob
+            from grscene import Occupancy
+            poses_grid = Occupancy.load(sorted(glob.glob(f"{args.grscene}/{args.sampler_map}_*.npz"))[0])
+            print(f"starts, goals and moving obstacles on {args.sampler_map}, clearance {args.inflate} m "
+                  f"(LOW {args.low_inflate}), open passages {args.open_passages}", flush=True)
+        sampler = StartGoalSampler(poses_grid, inflate=args.inflate, goal_min=args.goal_min, goal_max=args.goal_max,
+                                   path_max=args.path_max, seed=args.seed, low_inflate=args.low_inflate,
+                                   open_passages=args.open_passages)
         print(f"occupancy {occupancy.shape[1]}x{occupancy.shape[0]} cells in {time.time() - t0:.1f} s; "
               f"usable free area {sampler.area:.1f} m2", flush=True)
         floor = getattr(occupancy, "floor", 0.0)
